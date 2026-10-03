@@ -1,17 +1,17 @@
 """
 jeton_menu.py - لاگین با Selenium (+ کپچا)، سپس همه‌ی کارها با requests.
 
-    set JETON_USER=...   set JETON_PASS=...
-    python jeton_menu.py                    # هفته جاری
-    python jeton_menu.py --week next        # هفته بعد (ممکن است هنوز غذایی نداشته باشد)
-    python jeton_menu.py --all-selves --out menu.html   # فرمت از پسوند: .html | .json | .txt
+    python jeton_menu.py
+برنامه خودش همه‌چیز را می‌پرسد (نام کاربری/رمز اگر در JETON_USER و JETON_PASS تنظیم نشده باشد،
+هفته، فرمت و نام فایل). غذاهای همه‌ی سلف‌ها استخراج می‌شود.
 """
-import argparse
 import base64
 import json
 import logging
+import getpass
 import os
 import time
+import webbrowser
 
 import cv2
 import numpy as np
@@ -23,7 +23,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from skimage.metrics import structural_similarity as ssim
 
-from food_menu import WeekMenu, fetch_menu
+from food_menu import fetch_menu
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,8 +31,6 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://jeton.yazd.ac.ir/"
 HOME_URL = BASE_URL + "Master/Default.aspx"
 
-USERNAME = os.environ.get("JETON_USER", "----")
-PASSWORD = os.environ.get("JETON_PASS", "----")
 DATASET_PATH = os.environ.get("JETON_CAPTCHA_DATASET", r"C:\Users\iman\Documents\project\image vision\dataset")
 CAPTCHA_THRESHOLD = 0.4
 LOGIN_RETRIES = 5
@@ -84,10 +82,10 @@ def recognize(driver) -> str:
 
 
 # ------------------------------------------------------- لاگین (سلنیوم)
-def _try_login(driver) -> bool:
+def _try_login(driver, username: str, password: str) -> bool:
     driver.get(BASE_URL)
-    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtUsernamePlain"), USERNAME)
-    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtPasswordPlain"), PASSWORD)
+    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtUsernamePlain"), username)
+    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtPasswordPlain"), password)
     captcha = recognize(driver).strip()
     logger.info(f"کپچا: {captcha}")
     captcha_input = driver.find_element(By.ID, "txtCaptcha")
@@ -101,7 +99,7 @@ def _try_login(driver) -> bool:
         return False
 
 
-def get_session(headless: bool = False) -> requests.Session:
+def get_session(username: str, password: str, headless: bool = False) -> requests.Session:
     """با سلنیوم لاگین می‌کند، کوکی‌ها را به requests.Session می‌دهد و مرورگر را می‌بندد."""
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-gpu")
@@ -112,7 +110,7 @@ def get_session(headless: bool = False) -> requests.Session:
     try:
         for attempt in range(1, LOGIN_RETRIES + 1):
             logger.info(f"تلاش لاگین {attempt}/{LOGIN_RETRIES}")
-            if _try_login(driver):
+            if _try_login(driver, username, password):
                 break
             time.sleep(0.5)
         else:
@@ -127,27 +125,63 @@ def get_session(headless: bool = False) -> requests.Session:
         driver.quit()
 
 
-def get_menu(week: str = "current", all_selves: bool = False, session: requests.Session = None) -> WeekMenu:
-    """نقطه‌ی ورود اصلی. اگر session لاگین‌شده نداری، خودش لاگین می‌کند."""
-    return fetch_menu(session or get_session(), week=week, all_selves=all_selves)
+# ------------------------------------------------------------ پرسش‌ها
+def ask(prompt: str, default: str = "") -> str:
+    ans = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
+    return ans or default
+
+
+def choose(prompt: str, options: list[str], default: int = 1) -> int:
+    print(prompt)
+    for i, o in enumerate(options, 1):
+        print(f"  {i}) {o}")
+    while True:
+        ans = input(f"انتخاب [{default}]: ").strip() or str(default)
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return int(ans)
+        print("عدد معتبر وارد کن.")
+
+
+def collect_settings() -> dict:
+    global DATASET_PATH
+    print("=== دریافت برنامه غذایی ===\n")
+    username = os.environ.get("JETON_USER") or ask("نام کاربری")
+    password = os.environ.get("JETON_PASS") or getpass.getpass("رمز عبور (هنگام تایپ نمایش داده نمی‌شود): ")
+    if not os.path.isdir(DATASET_PATH):
+        print(f"پوشه‌ی دیتاست کپچا پیدا نشد: {DATASET_PATH}")
+        DATASET_PATH = ask("مسیر پوشه‌ی دیتاست کپچا")
+    week = ["current", "next"][choose("\nکدام هفته؟", ["هفته جاری", "هفته بعد (برای رزرو)"]) - 1]
+    ext = [".html", ".json", ".txt"][choose("\nفرمت خروجی؟", ["HTML (صفحه‌ی وب، خواناترین)", "JSON", "متن ساده"]) - 1]
+    out = ask("نام فایل خروجی", f"menu{ext}")
+    if not os.path.splitext(out)[1]:
+        out += ext
+    open_after = ext == ".html" and ask("بعد از ساخت، در مرورگر باز شود؟ (y/n)", "y").lower().startswith("y")
+    return dict(username=username, password=password, week=week, out=out, open_after=open_after)
+
+
+def main() -> None:
+    cfg = collect_settings()
+    print("\nدر حال ورود به سامانه ...")
+    session = get_session(cfg["username"], cfg["password"])
+
+    print("در حال دریافت برنامه غذایی همه‌ی سلف‌ها ...")
+    menu = fetch_menu(session, cfg["week"], all_selves=True,
+                      on_progress=lambda n, total: print(f"\r  {n}/{total}", end="", flush=True))
+    print()
+
+    if not menu.has_food:
+        print(f"\nبرای این هفته ({menu.week_range}) هنوز غذایی ثبت نشده است." + (f"\n{menu.message}" if menu.message else ""))
+        return
+
+    ext = os.path.splitext(cfg["out"])[1].lower()
+    content = (json.dumps(menu.to_dict(), ensure_ascii=False, indent=2) if ext == ".json"
+               else menu.to_text() if ext == ".txt" else menu.to_html())
+    with open(cfg["out"], "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"\nذخیره شد: {os.path.abspath(cfg['out'])}")
+    if cfg["open_after"]:
+        webbrowser.open("file://" + os.path.abspath(cfg["out"]))
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--week", choices=["current", "next"], default="current")
-    ap.add_argument("--all-selves", action="store_true")
-    ap.add_argument("--out", metavar="FILE", default="menu.html", help="پسوند: .html | .json | .txt")
-    args = ap.parse_args()
-
-    menu = get_menu(args.week, args.all_selves)
-    ext = os.path.splitext(args.out)[1].lower()
-    if ext == ".json":
-        content = json.dumps(menu.to_dict(), ensure_ascii=False, indent=2)
-    elif ext == ".txt":
-        content = menu.to_text()
-    else:
-        content = menu.to_html()
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(menu.to_text())
-    logger.info(f"ذخیره شد: {args.out}")
+    main()

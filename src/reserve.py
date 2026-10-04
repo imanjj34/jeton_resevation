@@ -5,7 +5,7 @@ reserve.py - انتخاب غذا و ثبت رزرو (و تغییر/لغو رزر
     choices = ...                                 # از صفحه‌ی HTML می‌آید
     delta = price_delta(menu, choices)            # جمع تغییر اعتبار
     اگر delta <= menu.credit :  submit(session, choices)
-    وگرنه                    :  save_pending(choices) و بعد wait_and_submit(...)
+    وگرنه                    :  save_pending(choices)؛ بعد از افزایش اعتبار دوباره ثبت می‌شود (بدون پایش مداوم)
 
 submit() دقیقاً مثل مرورگر عمل می‌کند: برای هر ردیف اول سلف را عوض می‌کند (postback)، بعد غذا را،
 بعد تیک رزرو را می‌گذارد و در پایان دکمه‌ی «ذخیره»ی همان وعده را می‌زند؛ سپس نتیجه را از صفحه‌ی
@@ -14,8 +14,6 @@ submit() دقیقاً مثل مرورگر عمل می‌کند: برای هر ر
 from __future__ import annotations
 
 import json
-import threading
-import time
 from dataclasses import asdict, dataclass
 from typing import Callable, Optional
 
@@ -253,7 +251,7 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
     return results
 
 
-# ------------------------------------------------------ ذخیره و انتظار برای موجودی
+# ------------------------------------------------------ ذخیره‌ی انتخاب‌ها (موجودی کم)
 def save_pending(choices: list[Choice], path: str = PENDING_FILE) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump([asdict(c) for c in choices], f, ensure_ascii=False, indent=2)
@@ -271,32 +269,3 @@ def clear_pending(path: str = PENDING_FILE) -> None:
     import os
     if os.path.exists(path):
         os.remove(path)
-
-
-def wait_and_submit(session, choices: list[Choice], relogin: Callable[[], object],
-                    interval_min: float = 10, log: Callable[[str], None] = print,
-                    stop: Optional["threading.Event"] = None) -> Optional[list[dict]]:
-    """
-    هر interval_min دقیقه اعتبار را چک می‌کند؛ به محض کافی شدن همان انتخاب‌ها را ثبت می‌کند.
-    اگر session منقضی شد، با relogin() دوباره وارد می‌شود. توقف: Ctrl+C یا stop.set() (نتیجه None).
-    """
-    while True:
-        if stop is not None and stop.is_set():
-            return None
-        try:
-            menu = current_state(session, choices)
-            delta = price_delta(menu, choices)
-            credit = menu.credit or 0
-            if delta <= credit:
-                log(f"اعتبار کافی است ({credit:,} از {delta:,}) - در حال ثبت ...")
-                return submit(session, choices, on_step=log)
-            log(f"{time.strftime('%H:%M:%S')}  اعتبار {credit:,} / لازم {delta:,}  (کمبود {delta - credit:,} ریال)")
-        except PermissionError:
-            log("session منقضی شده؛ ورود دوباره ...")
-            session = relogin()
-            continue
-        if stop is not None:
-            if stop.wait(interval_min * 60):
-                return None
-        else:
-            time.sleep(interval_min * 60)

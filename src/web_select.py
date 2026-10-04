@@ -11,17 +11,36 @@ web_select.py - انتخاب غذا داخل یک صفحه‌ی HTML و اعما
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
+import subprocess
 import threading
-import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from food_menu import WeekMenu
 from reserve import (Choice, _is_noop, clear_pending, current_state, find_day, find_meal, price_delta,
-                     read_credit, save_pending, submit, summary_lines, wait_and_submit)
+                     read_credit, save_pending, submit, summary_lines)
+
+
+def open_browser(url: str) -> None:
+    """ترجیحاً در Chrome باز می‌کند؛ اگر پیدا نشد، مرورگر پیش‌فرض."""
+    for name in ("chrome", "google-chrome", "chromium", "chromium-browser"):
+        try:
+            webbrowser.get(name).open(url)
+            return
+        except webbrowser.Error:
+            pass
+    for path in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                 os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
+        if os.path.exists(path):
+            subprocess.Popen([path, url])
+            return
+    webbrowser.open(url)
 
 
 def _parse_amount(v) -> int:
@@ -31,7 +50,7 @@ def _parse_amount(v) -> int:
 
 
 # ----------------------------------------------------------------- داده‌ی صفحه
-def build_data(menu: WeekMenu) -> dict:
+def build_data(menu: WeekMenu, preselect: dict | None = None) -> dict:
     meals = []
     for m in menu.meals:
         days = []
@@ -46,7 +65,7 @@ def build_data(menu: WeekMenu) -> dict:
                            for s in d.selves if s.foods],
             })
         meals.append({"key": m.key, "title": m.title, "days": days})
-    return {"week": menu.week_range, "credit": menu.credit or 0, "meals": meals}
+    return {"week": menu.week_range, "credit": menu.credit or 0, "meals": meals, "preselect": preselect or {}}
 
 
 def selections_to_choices(menu: WeekMenu, selections: list[dict]) -> list[Choice]:
@@ -81,19 +100,22 @@ def selections_to_choices(menu: WeekMenu, selections: list[dict]) -> list[Choice
 
 # ------------------------------------------------------------------ سرور
 class SelectionServer:
-    def __init__(self, session, menu: WeekMenu, relogin, default_wait_min: int = 10, pay_opener=None):
-        """pay_opener(session, amount) -> شیئی با close()؛ پنجره‌ی پرداخت اینترنتی را باز می‌کند (اختیاری)."""
+    def __init__(self, session, menu: WeekMenu, relogin, pay_opener=None):
+        """
+        pay_opener(session, amount) -> شیئی با close() و wait_for_result(stop) که پنجره‌ی پرداخت اینترنتی را
+        باز می‌کند و بعد از برگشت از بانک نتیجه را برمی‌گرداند (اختیاری؛ بدون آن بخش پرداخت پنهان است).
+        """
         self.session, self.menu, self._relogin = session, menu, relogin
         self.pay_opener = pay_opener
+        self.preselect: dict = {}
         self.pay_browser = None
         self.pay_opening = False  # از لحظه‌ی کلیک تا باز شدن پنجره؛ مانع دو بار باز شدن می‌شود
         self.pending_choices: list[Choice] = []
         self.shortfall = 0
-        self.default_wait_min = default_wait_min
         self.token = secrets.token_urlsafe(16)
         self.lock = threading.Lock()
         self.stop = threading.Event()
-        self.job = {"job": "idle", "log": [], "results": None, "ok": None, "paid": None}
+        self.job = {"job": "idle", "log": [], "results": None, "ok": None, "paid": None, "pay": None}
         self.httpd: ThreadingHTTPServer | None = None
 
     # -- کمکی‌ها
@@ -112,46 +134,12 @@ class SelectionServer:
             self.relogin()
             return fn()
 
+    def _busy(self) -> bool:
+        return self.job["job"] in ("submitting", "paying") or self.pay_opening or self.pay_browser is not None
+
     def _finish_soon(self) -> None:
         if self.httpd:
             threading.Timer(4.0, self.httpd.shutdown).start()
-
-    # -- API
-    def api_submit(self, body: dict) -> dict:
-        if self.job["job"] in ("waiting", "submitting", "paying"):
-            return {"state": "error", "message": "یک عملیات در حال انجام است؛ صبر کن تمام شود (یا انتظار را لغو کن)."}
-        wait_min = float(body.get("wait") or 0)
-        with self.lock:
-            choices = selections_to_choices(self.menu, body.get("selections", []))
-            if not choices:
-                return {"state": "nochange"}
-            fresh = self._with_relogin(lambda: current_state(self.session, choices))
-            delta, credit = price_delta(fresh, choices), fresh.credit or 0
-            base = {"lines": summary_lines(fresh, choices), "delta": delta, "credit": credit}
-
-            if delta <= credit:
-                self.job.update(job="submitting", log=[], results=None, ok=None)
-                threading.Thread(target=self._submit_job, args=(choices,), daemon=True).start()
-                return {"state": "started", **base}
-
-            save_pending(choices)
-            self.pending_choices, self.shortfall = choices, delta - credit
-            waiting = wait_min > 0
-            if waiting:
-                self.stop.clear()
-                self.job.update(job="waiting", log=[], results=None, ok=None)
-                threading.Thread(target=self._wait_job, args=(choices, wait_min), daemon=True).start()
-            return {"state": "insufficient", "shortfall": delta - credit, "waiting": waiting,
-                    "canPay": self.pay_opener is not None, **base}
-
-    def _submit_job(self, choices: list[Choice]) -> None:
-        """ثبت مرحله‌به‌مرحله روی سایت؛ پیشرفت زنده از طریق self.job['log'] به صفحه می‌رسد."""
-        try:
-            results = self._with_relogin(lambda: submit(self.session, choices, on_step=self._log))
-        except Exception as e:  # noqa: BLE001
-            self._log(f"خطا: {type(e).__name__}: {e}")
-            results = [{"meal": "-", "ok": False, "message": None, "problems": [f"{type(e).__name__}: {e}"]}]
-        self._finish(results)
 
     def _close_pay(self) -> None:
         if self.pay_browser is not None:
@@ -160,76 +148,82 @@ class SelectionServer:
             finally:
                 self.pay_browser = None
 
-    def _finish(self, results) -> None:
-        self._close_pay()
+    # -- ثبت رزرو
+    def api_submit(self, body: dict) -> dict:
+        if self._busy():
+            return {"state": "error", "message": "یک عملیات در حال انجام است؛ صبر کن تمام شود."}
+        with self.lock:
+            choices = selections_to_choices(self.menu, body.get("selections", []))
+            if not choices:
+                return {"state": "nochange"}
+            fresh = self._with_relogin(lambda: current_state(self.session, choices))
+            delta, credit = price_delta(fresh, choices), fresh.credit or 0
+            if self.menu:
+                self.menu.credit = credit
+            base = {"lines": summary_lines(fresh, choices), "delta": delta, "credit": credit}
+
+            if delta <= credit:
+                self.job.update(job="submitting", log=[], results=None, ok=None, paid=None, pay=None)
+                threading.Thread(target=self._submit_job, args=(choices,), daemon=True).start()
+                return {"state": "started", **base}
+
+            save_pending(choices)
+            self.pending_choices, self.shortfall = choices, delta - credit
+            return {"state": "insufficient", "shortfall": self.shortfall, "canPay": self.pay_opener is not None, **base}
+
+    def _submit_job(self, choices: list[Choice]) -> None:
+        """ثبت مرحله‌به‌مرحله روی سایت؛ پیشرفت زنده از طریق self.job['log'] به صفحه می‌رسد."""
+        try:
+            results = self._with_relogin(lambda: submit(self.session, choices, on_step=self._log))
+        except Exception as e:  # noqa: BLE001
+            self._log(f"خطا: {type(e).__name__}: {e}")
+            results = [{"meal": "-", "ok": False, "message": None, "problems": [f"{type(e).__name__}: {e}"]}]
         ok = all(r["ok"] for r in results)
         self.job.update(job="finished", results=results, ok=ok)
         if ok:
             clear_pending()
             self._finish_soon()
 
-    def _wait_job(self, choices: list[Choice], minutes: float) -> None:
-        results = None
-        try:
-            results = wait_and_submit(self.session, choices, self.relogin, minutes, log=self._log, stop=self.stop)
-        except Exception as e:  # noqa: BLE001 - خطا را به صفحه نشان می‌دهیم
-            self._log(f"خطا: {e}")
-        if results is None:
-            self.job.update(job="idle")
-            return
-        self._finish(results)
+    # -- بروزرسانی دستی موجودی (دکمه‌ی صفحه)
+    def api_credit(self) -> dict:
+        if self.job["job"] == "submitting":
+            return {"state": "error", "message": "ثبت رزرو در حال انجام است؛ بعد از پایانش بروزرسانی کن."}
+        credit = self._with_relogin(lambda: read_credit(self.session))
+        if credit is None:
+            return {"state": "error", "message": "موجودی از صفحه خوانده نشد."}
+        if self.menu:
+            self.menu.credit = credit
+        return {"state": "credit", "credit": credit}
 
-    def api_pay(self, body: dict) -> dict:
-        """باز کردن پنجره‌ی پرداخت اینترنتی برای جبران کمبود؛ بعد از بالا آمدن اعتبار، رزرو خودکار انجام می‌شود."""
+    # -- پرداخت اینترنتی
+    def _start_pay(self, amount: int, choices) -> dict:
         if self.pay_opener is None:
             return {"state": "error", "message": "پرداخت اینترنتی در این اجرا فعال نیست."}
+        if self._busy():
+            return {"state": "error", "message": "یک عملیات (یا پنجره‌ی پرداخت) از قبل باز است."}
+        self.stop.clear()
+        self.pay_opening = True
+        self.job.update(job="paying", log=[], results=None, ok=None, paid=None, pay=None)
+        threading.Thread(target=self._pay_job, args=(amount, choices), daemon=True).start()
+        return {"state": "paying", "amount": amount}
+
+    def api_pay(self, body: dict) -> dict:
+        """پرداخت برای جبران کمبود؛ بعد از پرداخت موفق (و کافی بودن اعتبار) همان انتخاب‌ها ثبت می‌شوند."""
         if not self.pending_choices or self.shortfall <= 0:
             return {"state": "error", "message": "ابتدا انتخاب‌ها را ثبت کن تا کمبود موجودی مشخص شود."}
-        if self.job["job"] in ("submitting", "paying") or self.pay_browser is not None or self.pay_opening:
-            return {"state": "error", "message": "یک عملیات (یا پنجره‌ی پرداخت) از قبل باز است."}
         amount = _parse_amount(body.get("amount"))
         if amount < self.shortfall:
             return {"state": "error", "message": f"مبلغ باید حداقل برابر کمبود ({self.shortfall:,} ریال) باشد."}
-        already_waiting = self.job["job"] == "waiting"
-        self.pay_opening = True
-        if not already_waiting:
-            self.stop.clear()
-            self.job.update(job="waiting", log=[], results=None, ok=None)
-        threading.Thread(target=self._pay_job, args=(amount, already_waiting), daemon=True).start()
-        return {"state": "paying", "amount": amount}
-
-    def _pay_job(self, amount: int, already_waiting: bool) -> None:
-        self._log(f"در حال باز کردن پنجره‌ی پرداخت اینترنتی ({amount:,} ریال) ...")
-        try:
-            self.pay_browser = self.pay_opener(self.session, amount)
-        except Exception as e:  # noqa: BLE001
-            self._log(f"خطا در باز کردن پنجره‌ی پرداخت: {type(e).__name__}: {e}")
-            if not already_waiting:
-                self.job.update(job="idle")
-            return
-        finally:
-            self.pay_opening = False
-        self._log("پنجره‌ی پرداخت باز شد. کارت و رمز را فقط در همان پنجره (صفحه‌ی بانک) وارد کن؛ "
-                  "بعد از بالا آمدن اعتبار، همین غذاها خودکار رزرو می‌شوند.")
-        if not already_waiting:
-            self._wait_job(self.pending_choices, 10 / 60)  # هر ۱۰ ثانیه اعتبار را چک می‌کند
+        return self._start_pay(amount, list(self.pending_choices))
 
     def api_topup(self, body: dict) -> dict:
-        """پرداخت مستقل با مبلغ دلخواه (مثلاً برای آزمایش درگاه)؛ بدون ربط به انتخاب غذاها."""
-        if self.pay_opener is None:
-            return {"state": "error", "message": "پرداخت اینترنتی در این اجرا فعال نیست."}
-        if self.job["job"] in ("waiting", "submitting", "paying") or self.pay_browser is not None or self.pay_opening:
-            return {"state": "error", "message": "یک عملیات (یا پنجره‌ی پرداخت) از قبل باز است."}
+        """پرداخت مستقل با مبلغ دلخواه (مثلاً برای آزمایش درگاه)؛ بدون ثبت رزرو."""
         amount = _parse_amount(body.get("amount"))
         if amount <= 0:
             return {"state": "error", "message": "مبلغ نامعتبر است."}
-        baseline = self._with_relogin(lambda: read_credit(self.session))
-        self.stop.clear()
-        self.job.update(job="paying", log=[], results=None, ok=None, paid=None)
-        threading.Thread(target=self._topup_job, args=(amount, baseline), daemon=True).start()
-        return {"state": "paying", "amount": amount, "baseline": baseline}
+        return self._start_pay(amount, None)
 
-    def _topup_job(self, amount: int, baseline: int | None, poll_sec: float = 10, max_min: float = 30) -> None:
+    def _pay_job(self, amount: int, choices) -> None:
         self._log(f"در حال باز کردن پنجره‌ی پرداخت اینترنتی ({amount:,} ریال) ...")
         try:
             self.pay_browser = self.pay_opener(self.session, amount)
@@ -237,44 +231,78 @@ class SelectionServer:
             self._log(f"خطا در باز کردن پنجره‌ی پرداخت: {type(e).__name__}: {e}")
             self.job.update(job="idle")
             return
-        self._log(f"پنجره‌ی پرداخت باز شد. پرداخت را در همان پنجره (صفحه‌ی بانک) کامل کن. اعتبار فعلی: {(baseline or 0):,} ریال؛ "
-                  "به محض تغییر اعتبار، همین‌جا اعلام می‌شود.")
-        waited = 0.0
-        while not self.stop.wait(poll_sec):
-            waited += poll_sec
-            try:
-                credit = self._with_relogin(lambda: read_credit(self.session))
-            except Exception as e:  # noqa: BLE001
-                self._log(f"خطا در خواندن اعتبار: {type(e).__name__}: {e}")
-                continue
-            if credit is not None and baseline is not None and credit > baseline:
-                self.menu.credit = credit
-                self.job.update(job="paid", ok=True, paid={"before": baseline, "after": credit})
-                self._log(f"پرداخت تأیید شد: اعتبار از {baseline:,} به {credit:,} ریال رسید (+{credit - baseline:,}).")
-                self._close_pay()
-                return
-            if int(waited) % 60 < poll_sec:
-                self._log(f"{time.strftime('%H:%M:%S')}  هنوز اعتبار تغییر نکرده ({(credit or 0):,} ریال)")
-            if waited >= max_min * 60:
-                self._log("بیش از ۳۰ دقیقه گذشت و اعتبار تغییر نکرد؛ پایش متوقف شد. اگر پرداخت کرده‌ای بعداً اعتبار را در سایت چک کن.")
-                self.job.update(job="idle")
-                return
-        # لغو شد (stop.set) - api_cancel خودش پنجره را می‌بندد
+        finally:
+            self.pay_opening = False
+        self._log("پنجره‌ی پرداخت باز شد و مبلغ تأیید شد. کارت و رمز را فقط در همان پنجره (صفحه‌ی بانک) وارد کن. "
+                  "بعد از برگشت به سایت، نتیجه خوانده می‌شود و (در صورت پرداخت موفق) ادامه می‌دهم.")
+        try:
+            res = self.pay_browser.wait_for_result(self.stop)  # فقط آدرس پنجره را می‌بیند، به سایت درخواست نمی‌زند
+        except Exception as e:  # noqa: BLE001
+            self._log(f"خطا در پایش پنجره‌ی پرداخت: {type(e).__name__}: {e}")
+            res = {"closed": True}
+        if res is None:  # لغو شد (api_cancel خودش پنجره را بسته)
+            self.job.update(job="idle")
+            return
+        self._close_pay()
+        if res.get("closed"):
+            self._log("پنجره‌ی پرداخت قبل از برگشت از بانک بسته شد. اگر پرداخت کرده‌ای «بروزرسانی موجودی» را بزن.")
+            self.job.update(job="idle")
+            return
+
+        self._log(f"نتیجه‌ی تراکنش: {res['result']} - {res['message']}"
+                  + (f" - کد پیگیری: {res['trace']}" if res.get("trace") else ""))
+        if not res["ok"]:
+            self.job.update(job="payfailed", pay=res)
+            return
+
+        # فقط یک بار، بعد از برگشت از بانک، اعتبار از سایت خوانده می‌شود
+        before = self.menu.credit if self.menu else None
+        try:
+            if choices:
+                fresh = self._with_relogin(lambda: current_state(self.session, choices))
+                credit, delta = fresh.credit or 0, price_delta(fresh, choices)
+            else:
+                credit, delta = self._with_relogin(lambda: read_credit(self.session)), 0
+        except Exception as e:  # noqa: BLE001
+            self._log(f"پرداخت موفق بود ولی خواندن اعتبار خطا داد ({type(e).__name__}: {e}). «بروزرسانی موجودی» را بزن.")
+            self.job.update(job="idle")
+            return
+        if self.menu:
+            self.menu.credit = credit
+        paid = {"before": before, "after": credit, "trace": res.get("trace", "")}
+        self._log(f"اعتبار پس از پرداخت: {credit:,} ریال")
+        if choices and delta <= credit:
+            self.job.update(job="submitting", paid=paid)
+            self._submit_job(choices)
+        else:
+            self.job.update(job="paid", paid=paid)
+            if choices:
+                self._log(f"اعتبار هنوز برای انتخاب‌ها کافی نیست (لازم: {delta:,} ریال).")
 
     def api_cancel(self) -> dict:
         self.stop.set()
         self._close_pay()
-        self.job.update(job="idle")
+        if self.job["job"] == "paying":
+            self.job.update(job="idle")
         return {"state": "cancelled"}
 
     # -- HTTP
     def page(self) -> bytes:
-        d = build_data(self.menu)
+        d = build_data(self.menu, self.preselect)
         d["canPay"] = self.pay_opener is not None
         data = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
-        html = (PAGE.replace("__DATA__", data).replace("__TOKEN__", self.token)
-                .replace("__WAIT__", str(self.default_wait_min)))
-        return html.encode("utf-8")
+        return PAGE.replace("__DATA__", data).replace("__TOKEN__", self.token).encode("utf-8")
+
+    def status(self) -> dict:
+        return self.job
+
+    def extra_get(self, path: str):
+        """قلاب برای زیرکلاس‌ها: (بدنه، content-type) یا None."""
+        return None
+
+    def routes(self) -> dict:
+        return {"/api/submit": self.api_submit, "/api/pay": self.api_pay, "/api/topup": self.api_topup,
+                "/api/credit": lambda body: self.api_credit(), "/api/cancel": lambda body: self.api_cancel()}
 
     def _handler(self):
         srv = self
@@ -285,6 +313,9 @@ class SelectionServer:
 
             def _ok_host(self) -> bool:
                 return self.headers.get("Host", "").split(":")[0] in ("127.0.0.1", "localhost")
+
+            def _ok_token_query(self, u) -> bool:
+                return secrets.compare_digest(parse_qs(u.query).get("t", [""])[0], srv.token)
 
             def _ok_token(self) -> bool:
                 return secrets.compare_digest(self.headers.get("X-Token", ""), srv.token)
@@ -307,23 +338,21 @@ class SelectionServer:
                 if u.path == "/" and secrets.compare_digest(parse_qs(u.query).get("t", [""])[0], srv.token):
                     return self._send(200, srv.page(), "text/html; charset=utf-8")
                 if u.path == "/api/status" and self._ok_token():
-                    return self._json(srv.job)
+                    return self._json(srv.status())
+                extra = srv.extra_get(u.path) if self._ok_token_query(u) else None
+                if extra:
+                    return self._send(200, extra[0], extra[1])
                 self._send(404, b"not found", "text/plain")
 
             def do_POST(self):
                 if not (self._ok_host() and self._ok_token()):
                     return self._send(403, b"forbidden", "text/plain")
+                routes = srv.routes()
                 try:
                     n = min(int(self.headers.get("Content-Length", 0)), 1_000_000)
                     body = json.loads(self.rfile.read(n) or b"{}")
-                    if self.path == "/api/submit":
-                        return self._json(srv.api_submit(body))
-                    if self.path == "/api/cancel":
-                        return self._json(srv.api_cancel())
-                    if self.path == "/api/pay":
-                        return self._json(srv.api_pay(body))
-                    if self.path == "/api/topup":
-                        return self._json(srv.api_topup(body))
+                    if self.path in routes:
+                        return self._json(routes[self.path](body))
                     self._send(404, b"not found", "text/plain")
                 except Exception as e:  # noqa: BLE001
                     self._json({"state": "error", "message": f"{type(e).__name__}: {e}"})
@@ -334,11 +363,11 @@ class SelectionServer:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         return f"http://127.0.0.1:{self.httpd.server_address[1]}/?t={self.token}"
 
-    def run(self, open_browser: bool = True) -> None:
+    def run(self, launch: bool = True) -> None:
         url = self.start()
         print(f"\nصفحه‌ی انتخاب غذا: {url}")
-        if open_browser:
-            webbrowser.open(url)
+        if launch:
+            open_browser(url)
         print("بعد از انتخاب همه‌ی غذاها در صفحه روی «ثبت نهایی» بزن. توقف برنامه: Ctrl+C")
         try:
             self.httpd.serve_forever()
@@ -376,7 +405,7 @@ button{font-family:inherit;font-size:15px;padding:8px 18px;border:0;border-radiu
 button:disabled{background:#aaa;cursor:not-allowed}button.sec{background:#757575}
 #topup{margin:8px 0;padding:6px 10px;border:1px solid #bbdefb;border-radius:6px;background:#f5faff}#topup summary{cursor:pointer;font-weight:bold;color:#1565c0}.topbox{margin-top:8px}.topbox .hint{color:#666;font-size:12px;margin-top:4px}
 #payrow{display:none;margin:6px 0;font-size:14px}#payrow .hint{color:#666;font-size:12px;margin-top:2px}button.pay{background:#1565c0;padding:5px 14px;font-size:14px}
-#waitrow{display:none;margin:6px 0;font-size:14px}#waitrow input{width:60px}
+button.small{font-size:12px;padding:3px 10px}#numsrow{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
 #out{margin:10px 0;padding:10px;border-radius:6px;display:none;white-space:pre-wrap;line-height:1.8}
 #out.ok{background:#e8f5e9;border:1px solid #a5d6a7}#out.err{background:#ffebee;border:1px solid #ef9a9a}#out.info{background:#fff8e1;border:1px solid #ffe082}
 </style></head><body>
@@ -385,25 +414,24 @@ button:disabled{background:#aaa;cursor:not-allowed}button.sec{background:#757575
 <details id="topup" style="display:none"><summary>افزایش اعتبار / آزمایش پرداخت اینترنتی (مستقل از انتخاب غذا)</summary>
  <div class="topbox">مبلغ <input id="topamt" type="text" size="12" value="10,000"> ریال
  <button id="topgo" class="pay">رفتن به درگاه پرداخت</button>
- <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار اینترنتی» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از بالا آمدن اعتبار، همین‌جا اعلام می‌شود (رزروی انجام نمی‌شود).</div></div>
+ <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار اینترنتی» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از برگشت از بانک، نتیجه‌ی تراکنش و اعتبار جدید همین‌جا اعلام می‌شود (رزروی انجام نمی‌شود).</div></div>
 </details>
 <div id="out"></div>
 <div id="meals"></div>
 <div id="bar"><div class="in">
- <div id="nums"></div>
+ <div id="numsrow"><span id="nums"></span> <button id="refreshcredit" class="sec small" title="خواندن دوباره‌ی موجودی از سایت">بروزرسانی موجودی</button></div>
  <ul id="chg"></ul>
- <div id="waitrow">موجودی کافی نیست. اگر خواستی هر <input id="wait" type="number" min="0" value="__WAIT__"> دقیقه موجودی چک شود و به محض کافی شدن، همین انتخاب‌ها خودکار رزرو شوند (0 = فقط ذخیره کن).</div>
  <div id="payrow">پرداخت اینترنتی: مبلغ <input id="payamt" type="text" size="12"> ریال
   <button id="pay" class="pay">رفتن به درگاه پرداخت</button>
-  <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از بالا آمدن اعتبار، همین غذاها خودکار رزرو می‌شوند.</div></div>
+  <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از برگشت از بانک و تأیید پرداخت، اعتبار یک بار بررسی می‌شود و در صورت کافی بودن، همین غذاها خودکار رزرو می‌شوند. اگر پرداخت را جای دیگری انجام دادی، «بروزرسانی موجودی» و بعد «ثبت نهایی» را بزن.</div></div>
  <button id="go" disabled>ثبت نهایی در سایت</button>
- <button id="stopwait" class="sec" style="display:none">لغو انتظار</button>
+ <button id="stopwait" class="sec" style="display:none">لغو پرداخت</button>
 </div></div>
 <script>
 var DATA = __DATA__;
 var TOKEN = "__TOKEN__";
 var rows = [];       // {meal, day, name, initial, prices:{value:price}, labels:{value:text}}
-var busy = false, poll = null;
+var busy = false, poll = null, preApplied = 0;
 
 function h(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e; }
 function fmt(n){ return String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
@@ -456,6 +484,12 @@ function build(){
           radio(value, span, f.cur, "");
         });
       });
+      var pv = DATA.preselect && DATA.preselect[meal.key + "|" + day.date];
+      if(pv){
+        var els = document.getElementsByName(name), has = false, k;
+        for(k=0;k<els.length;k++) if(els[k].value===pv) has = true;
+        if(has){ for(k=0;k<els.length;k++) els[k].checked = (els[k].value===pv); preApplied++; }
+      }
       rows.push(info);
     });
     table.appendChild(tb); root.appendChild(table);
@@ -493,7 +527,6 @@ function refresh(){
   if(short>0) item("کمبود", fmt(short) + " ریال", "bad");
   var ul = document.getElementById("chg"); ul.innerHTML="";
   c.list.forEach(function(t){ ul.appendChild(h("li","",t)); });
-  document.getElementById("waitrow").style.display = short>0 ? "block" : "none";
   document.getElementById("go").disabled = busy || c.list.length===0;
 }
 
@@ -523,27 +556,33 @@ function startPoll(){
   if(poll) clearInterval(poll);
   poll = setInterval(function(){
     api("GET", "/api/status", null, function(j){
-      var log = (j.log||[]).join("\n");
+      var log = (j.log||[]).join("\n"), stopBtn = document.getElementById("stopwait");
       if(j.job==="paying"){
-        document.getElementById("stopwait").style.display="inline-block";
-        show("info", "در انتظار تأیید پرداخت ...\n\n" + log);
+        stopBtn.style.display="inline-block";
+        show("info", "پنجره‌ی پرداخت باز است؛ پرداخت را در صفحه‌ی بانک کامل کن. بعد از برگشت به سایت، خودکار ادامه می‌دهم.\n\n" + log);
       }
+      else if(j.job==="submitting"){ stopBtn.style.display="none"; show("info", "در حال اعمال تغییرات روی سایت (مرحله به مرحله) ...\n\n" + log); }
       else if(j.job==="paid"){
-        clearInterval(poll); document.getElementById("stopwait").style.display="none";
-        DATA.credit = j.paid.after; refresh();
-        show("ok", "پرداخت تأیید شد: اعتبار از " + fmt(j.paid.before) + " به " + fmt(j.paid.after) + " ریال رسید (+" + fmt(j.paid.after - j.paid.before) + ").");
+        clearInterval(poll); stopBtn.style.display="none";
+        if(j.paid && j.paid.after!=null){ DATA.credit = j.paid.after; refresh(); }
+        show("ok", "پرداخت موفق بود." + (j.paid && j.paid.after!=null ? "\nاعتبار فعلی: " + fmt(j.paid.after) + " ریال" : "") + (j.paid && j.paid.trace ? "\nکد پیگیری: " + j.paid.trace : "") + "\n\n" + log);
         setBusy(false);
       }
-      else if(j.job==="submitting"){ show("info", "در حال اعمال تغییرات روی سایت (مرحله به مرحله) ...\n\n" + log); }
-      else if(j.job==="waiting"){
-        document.getElementById("stopwait").style.display="inline-block";
-        show("info", "در انتظار شارژ موجودی (یا در حال ثبت) ...\n\n" + log);
+      else if(j.job==="payfailed"){
+        clearInterval(poll); stopBtn.style.display="none";
+        show("err", "پرداخت ناموفق بود: " + ((j.pay && j.pay.message) || "") + "\n\n" + log);
+        setBusy(false);
       }
       else if(j.job==="finished"){
-        clearInterval(poll); document.getElementById("stopwait").style.display="none";
-        show(j.ok?"ok":"err", (j.ok ? "همه‌ی تغییرات ثبت و تأیید شد. این صفحه و برنامه تا چند ثانیه‌ی دیگر بسته می‌شوند.\n" : "بعضی موارد ثبت نشد:\n") + resultsText(j.results||[]) + "\n\nمراحل انجام‌شده:\n" + log);
+        clearInterval(poll); stopBtn.style.display="none";
+        var pre = (j.paid && j.paid.after!=null) ? ("پرداخت موفق بود (اعتبار فعلی: " + fmt(j.paid.after) + " ریال). سپس:\n") : "";
+        show(j.ok?"ok":"err", pre + (j.ok ? "همه‌ی تغییرات ثبت و تأیید شد. این صفحه و برنامه تا چند ثانیه‌ی دیگر بسته می‌شوند.\n" : "بعضی موارد ثبت نشد:\n") + resultsText(j.results||[]) + "\n\nمراحل انجام‌شده:\n" + log);
         setBusy(false);
-      } else if(j.job==="idle"){ clearInterval(poll); document.getElementById("stopwait").style.display="none"; setBusy(false); }
+      } else if(j.job==="idle"){
+        clearInterval(poll); stopBtn.style.display="none";
+        if(log) show("info", log);
+        setBusy(false);
+      }
     });
   }, 1500);
 }
@@ -553,18 +592,19 @@ document.getElementById("go").onclick = function(){
   if(!confirm("این تغییرات روی سایت اصلی اعمال می‌شود:\n\n" + c.list.join("\n") + "\n\nجمع تغییر اعتبار: " + sgn(c.delta) + " ریال\nادامه می‌دهی؟")) return;
   var sels = rows.map(function(r){ return {meal: r.meal.key, date: r.day.date, value: current(r)}; });
   setBusy(true);
-  api("POST", "/api/submit", {selections: sels, wait: parseFloat(document.getElementById("wait").value)||0}, function(j){
+  api("POST", "/api/submit", {selections: sels}, function(j){
     if(j.state==="started"){
       show("info", "شروع شد ...");
       startPoll();
     } else if(j.state==="insufficient"){
-      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در فایل pending.json ذخیره شد." + (j.waiting ? "\nمنتظر شارژ می‌مانم و به محض کافی شدن، همین غذاها را رزرو می‌کنم. این صفحه و برنامه را باز نگه دار." : "\nبعداً از گزینه‌ی «ادامه‌ی انتخاب‌های ذخیره‌شده» در برنامه ادامه بده."));
+      DATA.credit = j.credit; refresh();
+      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در فایل pending.json ذخیره شد." + (j.canPay ? "\nمی‌توانی از «پرداخت اینترنتی» پایین صفحه پرداخت کنی (بعد از پرداخت موفق، خودکار رزرو می‌شود)، یا بعد از شارژ از راه دیگر «بروزرسانی موجودی» و دوباره «ثبت نهایی» را بزن." : "\nبعد از شارژ، «بروزرسانی موجودی» و دوباره «ثبت نهایی» را بزن."));
       if(j.canPay){
         var amt = Math.max(10000, Math.ceil(j.shortfall/1000)*1000);
         document.getElementById("payamt").value = fmt(amt);
         document.getElementById("payrow").style.display = "block";
       }
-      if(j.waiting) startPoll(); else setBusy(false);
+      setBusy(false);
     } else if(j.state==="nochange"){ show("info", "تغییری انتخاب نشده است."); setBusy(false); }
     else { show("err", j.message || "خطا"); setBusy(false); }
   });
@@ -580,17 +620,26 @@ document.getElementById("topgo").onclick = function(){
 };
 document.getElementById("pay").onclick = function(){
   var amt = parseInt(String(document.getElementById("payamt").value).replace(/[^0-9]/g,""), 10) || 0;
-  if(!confirm("مبلغ " + fmt(amt) + " ریال به درگاه پرداخت فرستاده می‌شود.\nپرداخت را خودت در پنجره‌ی بانک کامل می‌کنی.\nادامه می‌دهی؟")) return;
+  if(!confirm("مبلغ " + fmt(amt) + " ریال به درگاه پرداخت فرستاده می‌شود.\nپرداخت را خودت در پنجره‌ی بانک کامل می‌کنی؛ بعد از پرداخت موفق، همین غذاها خودکار رزرو می‌شوند.\nادامه می‌دهی؟")) return;
   api("POST", "/api/pay", {amount: amt}, function(j){
     if(j.state==="paying"){ document.getElementById("payrow").style.display="none"; busy=true; refresh(); show("info","در حال باز کردن پنجره‌ی پرداخت ..."); startPoll(); }
     else show("err", j.message || "خطا");
   });
 };
 document.getElementById("stopwait").onclick = function(){
-  api("POST", "/api/cancel", {}, function(){ if(poll) clearInterval(poll); document.getElementById("stopwait").style.display="none"; show("info","انتظار لغو شد. انتخاب‌ها در pending.json مانده است."); setBusy(false); });
+  api("POST", "/api/cancel", {}, function(){ if(poll) clearInterval(poll); document.getElementById("stopwait").style.display="none"; show("info","پرداخت لغو شد و پنجره بسته شد. اگر قبلاً پرداخت کرده‌ای، «بروزرسانی موجودی» را بزن. انتخاب‌های ذخیره‌شده در pending.json مانده است."); setBusy(false); });
 };
 
+document.getElementById("refreshcredit").onclick = function(){
+  var b = this; b.disabled = true;
+  api("POST", "/api/credit", {}, function(j){
+    b.disabled = false;
+    if(j.state==="credit"){ DATA.credit = j.credit; refresh(); show("ok", "موجودی بروز شد: " + fmt(j.credit) + " ریال"); }
+    else show("err", j.message || "خطا");
+  });
+};
 if(DATA.canPay) document.getElementById("topup").style.display="block";
 build(); refresh();
+if(preApplied>0) show("info", "انتخاب‌های ذخیره‌شده‌ی قبلی (" + preApplied + " مورد) اعمال شد؛ بررسی کن و «ثبت نهایی» را بزن.");
 </script></body></html>
 """

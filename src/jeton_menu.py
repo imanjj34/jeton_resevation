@@ -1,10 +1,15 @@
 """
 jeton_menu.py - لاگین با Selenium (+ کپچا)، سپس همه‌ی کارها با requests.
 
-    python jeton_menu.py
-برنامه خودش همه‌چیز را می‌پرسد: دریافت منو و ساخت فایل، یا انتخاب غذا و ثبت رزرو (با بررسی
-موجودی؛ اگر کم بود انتخاب‌ها ذخیره می‌شوند و بعد از شارژ خودکار رزرو می‌شوند).
+    python jeton_menu.py              # پرسش‌ها در ترمینال (پیش‌فرض: DEFAULT_UI)
+    python jeton_menu.py --ui web     # از همان اول Chrome باز می‌شود و همه‌چیز مرحله‌به‌مرحله در صفحه‌ی وب انجام می‌شود
+    python jeton_menu.py --headed     # مرورگر لاگین/کپچا دیده شود (برای اشکال‌یابی)
+
+پیش‌فرض‌ها (ویرایش در بلوک «تنظیمات پیش‌فرض» پایین): مشاهده و رزرو، هفته‌ی بعد، مرورگر لاگین مخفی (headless).
 """
+from __future__ import annotations
+
+import argparse
 import base64
 import json
 import logging
@@ -24,8 +29,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from skimage.metrics import structural_similarity as ssim
 
 from food_menu import fetch_menu
-from reserve import (PENDING_FILE, clear_pending, current_state, load_pending, price_delta, summary_lines,
-                     wait_and_submit)
+from payment import CALLBACK_MARK, parse_callback
+from reserve import PENDING_FILE, clear_pending, current_state, load_pending, price_delta, submit, summary_lines
+from web_app import AppServer
 from web_select import SelectionServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -34,6 +40,12 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://jeton.yazd.ac.ir/"
 HOME_URL = BASE_URL + "Master/Default.aspx"
 EPAY_URL = BASE_URL + "ePay/ePay_Payment.aspx"
+
+# ----------------------------------------------------------------- تنظیمات پیش‌فرض
+DEFAULT_UI = os.environ.get("JETON_UI", "terminal")  # "terminal" یا "web" (با --ui هم عوض می‌شود)
+DEFAULT_MODE = "reserve"   # reserve = مشاهده و رزرو | file = فقط منو و فایل | pending = انتخاب‌های ذخیره‌شده
+DEFAULT_WEEK = "next"      # current = هفته جاری | next = هفته بعد
+HEADLESS_LOGIN = True      # مرورگر لاگین/کپچا مخفی باشد. پنجره‌ی پرداخت همیشه دیده می‌شود (کارت را خودت وارد می‌کنی)
 
 DATASET_PATH = os.environ.get("JETON_CAPTCHA_DATASET", r"C:\Users\iman\Documents\project\image vision\dataset")
 CAPTCHA_THRESHOLD = 0.4
@@ -109,6 +121,7 @@ def _new_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     if headless:
         options.add_argument("--headless=new")
+        options.add_argument("--window-size=1280,900")
     return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None, options=options)
 
 
@@ -126,9 +139,9 @@ def _cookies_to_session(driver, session: requests.Session) -> None:
         session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
 
 
-def get_session(username: str, password: str, headless: bool = False) -> requests.Session:
-    """با سلنیوم لاگین می‌کند، کوکی‌ها را به requests.Session می‌دهد و مرورگر را می‌بندد."""
-    driver = _new_driver(headless)
+def get_session(username: str, password: str, headless: bool | None = None) -> requests.Session:
+    """با سلنیوم لاگین می‌کند (پیش‌فرض: مخفی)، کوکی‌ها را به requests.Session می‌دهد و مرورگر را می‌بندد."""
+    driver = _new_driver(HEADLESS_LOGIN if headless is None else headless)
     try:
         _driver_login(driver, username, password)
         session = requests.Session()
@@ -146,6 +159,28 @@ class PaymentBrowser:
     def __init__(self, driver):
         self.driver = driver
 
+    def wait_for_result(self, stop, timeout_sec: float = 1800, poll_sec: float = 1.0):
+        """
+        منتظر می‌ماند تا مرورگر از بانک به ePay_CallBack.aspx برگردد و نتیجه را از همان صفحه می‌خواند.
+        فقط آدرس پنجره را می‌بیند (محلی است)؛ هیچ درخواستی به سایت/بانک نمی‌زند.
+        خروجی: دیکشنری نتیجه | {"closed": True} اگر پنجره بسته شد | None اگر stop خورد یا مهلت تمام شد.
+        """
+        waited = 0.0
+        while not stop.is_set() and waited < timeout_sec:
+            try:
+                url = self.driver.current_url
+            except Exception:  # noqa: BLE001  (پنجره را کاربر بسته است)
+                return {"closed": True}
+            if CALLBACK_MARK in url:
+                try:
+                    WebDriverWait(self.driver, 15).until(lambda d: d.find_elements(By.ID, "cphMain_lblResult"))
+                except Exception:  # noqa: BLE001
+                    pass
+                return parse_callback(self.driver.page_source)
+            stop.wait(poll_sec)
+            waited += poll_sec
+        return None
+
     def close(self) -> None:
         try:
             self.driver.quit()
@@ -153,11 +188,18 @@ class PaymentBrowser:
             pass
 
 
+def _page_alert(driver) -> str:
+    return (driver.execute_script(
+        "var e=document.getElementById('cphMain_alertBoxValue');return e?e.textContent:'';") or "").strip()
+
+
 def open_payment(session: requests.Session, amount: int, username: str, password: str) -> PaymentBrowser:
     """
-    یک پنجره‌ی Chrome باز می‌کند (با همان کوکی‌های لاگین)، صفحه‌ی «افزایش اعتبار اینترنتی» را باز می‌کند،
-    مبلغ را می‌نویسد و روی درگاه پرداخت کلیک می‌کند. بقیه‌اش (کارت و رمز) را خود کاربر در صفحه‌ی بانک
-    انجام می‌دهد؛ اطلاعات کارت هیچ‌وقت از این برنامه عبور نمی‌کند. پنجره باز می‌ماند تا PaymentBrowser.close().
+    یک پنجره‌ی Chrome باز می‌کند (با همان کوکی‌های لاگین) و مثل کاربر جلو می‌رود:
+      ۱) صفحه‌ی «افزایش اعتبار اینترنتی»: مبلغ را می‌نویسد و روی درگاه کلیک می‌کند.
+      ۲) صفحه‌ی «تأیید پرداخت»: اگر مبلغِ نشان‌داده‌شده با مبلغ خواسته‌شده یکی بود، «پرداخت» را می‌زند.
+      ۳) از اینجا به بعد (کارت و رمز در صفحه‌ی بانک) فقط کار خود کاربر است؛ اطلاعات کارت از این برنامه عبور نمی‌کند.
+    پنجره باز می‌ماند تا PaymentBrowser.close().
     """
     driver = _new_driver()
     try:
@@ -174,6 +216,16 @@ def open_payment(session: requests.Session, amount: int, username: str, password
         box = driver.find_element(By.ID, "cphMain_txtPaymentAmount")
         driver.execute_script("arguments[0].value = arguments[1];", box, f"{amount:,}")
         driver.find_element(By.ID, "cphMain_dataLstBank_imgBankLogo_0").click()
+
+        # صفحه‌ی تأیید (با ajax عوض می‌شود): یا دکمه‌ی «پرداخت» می‌آید یا پیام خطا
+        WebDriverWait(driver, 15).until(lambda d: d.find_elements(By.ID, "cphMain_btnPay") or _page_alert(d))
+        if not driver.find_elements(By.ID, "cphMain_btnPay"):
+            raise RuntimeError(f"سایت مبلغ را نپذیرفت: {_page_alert(driver)}")
+        shown = "".join(ch for ch in driver.find_element(By.ID, "cphMain_lblPaymentAmount_").text if ch.isdigit())
+        if shown != str(amount):
+            driver.find_element(By.ID, "cphMain_btnCancel").click()
+            raise RuntimeError(f"مبلغ صفحه‌ی تأیید ({shown or '؟'}) با مبلغ خواسته‌شده ({amount}) یکی نیست؛ انصراف زده شد")
+        driver.find_element(By.ID, "cphMain_btnPay").click()
         return PaymentBrowser(driver)
     except Exception:
         driver.quit()
@@ -208,7 +260,8 @@ def login_prompt() -> tuple[str, str]:
 
 
 def ask_week() -> str:
-    return ["current", "next"][choose("\nکدام هفته؟", ["هفته جاری", "هفته بعد (برای رزرو)"]) - 1]
+    weeks = ["current", "next"]
+    return weeks[choose("\nکدام هفته؟", ["هفته جاری", "هفته بعد (برای رزرو)"], weeks.index(DEFAULT_WEEK) + 1) - 1]
 
 
 def show_progress(n: int, total: int) -> None:
@@ -256,18 +309,6 @@ def mode_menu_file(session) -> None:
         webbrowser.open("file://" + os.path.abspath(out))
 
 
-def wait_flow(session, choices, relogin) -> None:
-    minutes = float(ask("هر چند دقیقه موجودی چک شود تا خودکار رزرو شود؟ (0 = خروج)", "10") or 0)
-    if minutes <= 0:
-        print(f"انتخاب‌ها در {PENDING_FILE} ذخیره است؛ بعداً از گزینه‌ی «ادامه‌ی انتخاب‌های ذخیره‌شده» ادامه بده.")
-        return
-    print("در حال انتظار ... (توقف: Ctrl+C؛ انتخاب‌ها در فایل می‌مانند)")
-    try:
-        report(wait_and_submit(session, choices, relogin, minutes))
-    except KeyboardInterrupt:
-        print(f"\nمتوقف شد. انتخاب‌ها در {PENDING_FILE} ذخیره است.")
-
-
 def mode_reserve(session, relogin, username: str, password: str) -> None:
     week = ask_week()
     print("\nدر حال دریافت برنامه غذایی همه‌ی سلف‌ها ...")
@@ -282,38 +323,83 @@ def mode_reserve(session, relogin, username: str, password: str) -> None:
 
 
 def mode_pending(session, relogin) -> None:
+    """انتخاب‌های ذخیره‌شده را (فقط یک بار موجودی را چک می‌کند) در صورت کافی بودن اعتبار ثبت می‌کند."""
     choices = load_pending()
     try:
         menu = current_state(session, choices)
-        print("\nانتخاب‌های ذخیره‌شده:\n" + "\n".join(summary_lines(menu, choices)))
-        print(f"\nلازم: {price_delta(menu, choices):,}  |  موجودی: {(menu.credit or 0):,} ریال")
     except LookupError as e:
         print(f"\n{e}\nاین انتخاب‌ها دیگر معتبر نیستند؛ فایل {PENDING_FILE} را حذف می‌کنم.")
         clear_pending()
         return
-    wait_flow(session, choices, relogin)
+    delta, credit = price_delta(menu, choices), menu.credit or 0
+    print("\nانتخاب‌های ذخیره‌شده:\n" + "\n".join(summary_lines(menu, choices)))
+    print(f"\nجمع تغییر: {delta:+,} ریال  |  موجودی: {credit:,} ریال")
+    if delta > credit:
+        print(f"\nموجودی هنوز کافی نیست؛ کمبود: {delta - credit:,} ریال.\n"
+              "بعد از افزایش اعتبار (مثلاً از «پرداخت اینترنتی» در صفحه‌ی انتخاب غذا) دوباره همین گزینه را اجرا کن.")
+        return
+    if ask("\nثبت شود؟ (y/n)", "y").lower().startswith("y"):
+        report(submit(session, choices, on_step=print))
 
 
-def main() -> None:
+MODE_KEYS = ["reserve", "file", "pending"]
+
+
+def terminal_main() -> None:
     print("=== سامانه‌ی تغذیه ===\n")
     username, password = login_prompt()
     pending = load_pending()
-    options = ["فقط دریافت منو و ساخت فایل", "انتخاب غذا (در صفحه‌ی وب) و ثبت رزرو"]
+    options = ["مشاهده‌ی منو، انتخاب غذا (در صفحه‌ی وب) و ثبت رزرو", "فقط دریافت منو و ساخت فایل"]
     if pending:
-        options.append(f"ادامه‌ی انتخاب‌های ذخیره‌شده ({len(pending)} مورد، منتظر موجودی)")
-    mode = choose("\nچه کاری انجام شود؟", options, 2)
+        options.append(f"ثبت انتخاب‌های ذخیره‌شده ({len(pending)} مورد، بعد از شارژ موجودی)")
+    default = MODE_KEYS.index(DEFAULT_MODE) + 1 if MODE_KEYS.index(DEFAULT_MODE) < len(options) else 1
+    mode = MODE_KEYS[choose("\nچه کاری انجام شود؟", options, default) - 1]
 
     print("\nدر حال ورود به سامانه ...")
-    session = get_session(username, password, True)
-    relogin = lambda: get_session(username, password, True)
-    if mode == 1:
-        mode_menu_file(session)
-    elif mode == 2:
+    session = get_session(username, password)
+    relogin = lambda: get_session(username, password)
+    if mode == "reserve":
         mode_reserve(session, relogin, username, password)
+    elif mode == "file":
+        mode_menu_file(session)
     else:
         mode_pending(session, relogin)
 
 
+def web_main() -> None:
+    """از همان اول Chrome باز می‌شود و ورود، انتخاب کار، دریافت منو و انتخاب غذا همه در صفحه‌ی وب انجام می‌شود."""
+    creds: dict = {}
+
+    def login(u: str, p: str) -> requests.Session:
+        s = get_session(u, p)
+        creds.update(u=u, p=p)  # فقط در حافظه، برای ورود دوباره و پرداخت
+        return s
+
+    def set_dataset(path: str) -> None:
+        global DATASET_PATH
+        DATASET_PATH = path
+
+    AppServer(
+        login=login,
+        fetch=lambda session, week, on_progress: fetch_menu(session, week, all_selves=True, on_progress=on_progress),
+        relogin=lambda: get_session(creds["u"], creds["p"]),
+        pay_opener=lambda sess, amount: open_payment(sess, amount, creds["u"], creds["p"]),
+        env_user=os.environ.get("JETON_USER"), env_pass=os.environ.get("JETON_PASS"),
+        dataset_ok=lambda: os.path.isdir(DATASET_PATH), set_dataset=set_dataset,
+        default_mode=DEFAULT_MODE, default_week=DEFAULT_WEEK,
+    ).run()
+
+
+def main() -> None:
+    global HEADLESS_LOGIN
+    ap = argparse.ArgumentParser(description="دریافت منو و رزرو غذا")
+    ap.add_argument("--ui", choices=("terminal", "web"), default=DEFAULT_UI, help="پرسش‌ها در ترمینال یا در صفحه‌ی وب")
+    ap.add_argument("--headed", action="store_true", help="مرورگر لاگین/کپچا مخفی نباشد")
+    args = ap.parse_args()
+    if args.headed:
+        HEADLESS_LOGIN = False
+    web_main() if args.ui == "web" else terminal_main()
+
+
 if __name__ == "__main__":
     main()
-    

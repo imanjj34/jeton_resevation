@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://jeton.yazd.ac.ir/"
 HOME_URL = BASE_URL + "Master/Default.aspx"
+EPAY_URL = BASE_URL + "ePay/ePay_Payment.aspx"
 
 DATASET_PATH = os.environ.get("JETON_CAPTCHA_DATASET", r"C:\Users\iman\Documents\project\image vision\dataset")
 CAPTCHA_THRESHOLD = 0.4
@@ -102,30 +103,81 @@ def _try_login(driver, username: str, password: str) -> bool:
         return False
 
 
-def get_session(username: str, password: str, headless: bool = False) -> requests.Session:
-    """با سلنیوم لاگین می‌کند، کوکی‌ها را به requests.Session می‌دهد و مرورگر را می‌بندد."""
+def _new_driver(headless: bool = False) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-gpu")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     if headless:
         options.add_argument("--headless=new")
-    driver = webdriver.Chrome(service=Service(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None, options=options)
-    try:
-        for attempt in range(1, LOGIN_RETRIES + 1):
-            logger.info(f"تلاش لاگین {attempt}/{LOGIN_RETRIES}")
-            if _try_login(driver, username, password):
-                break
-            time.sleep(0.5)
-        else:
-            raise RuntimeError("لاگین ناموفق (نام کاربری/رمز یا تشخیص کپچا را بررسی کن)")
+    return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None, options=options)
 
+
+def _driver_login(driver, username: str, password: str) -> None:
+    for attempt in range(1, LOGIN_RETRIES + 1):
+        logger.info(f"تلاش لاگین {attempt}/{LOGIN_RETRIES}")
+        if _try_login(driver, username, password):
+            return
+        time.sleep(0.5)
+    raise RuntimeError("لاگین ناموفق (نام کاربری/رمز یا تشخیص کپچا را بررسی کن)")
+
+
+def _cookies_to_session(driver, session: requests.Session) -> None:
+    for c in driver.get_cookies():
+        session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+
+
+def get_session(username: str, password: str, headless: bool = False) -> requests.Session:
+    """با سلنیوم لاگین می‌کند، کوکی‌ها را به requests.Session می‌دهد و مرورگر را می‌بندد."""
+    driver = _new_driver(headless)
+    try:
+        _driver_login(driver, username, password)
         session = requests.Session()
         session.headers["User-Agent"] = driver.execute_script("return navigator.userAgent;")
-        for c in driver.get_cookies():
-            session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+        _cookies_to_session(driver, session)
         return session
     finally:
         driver.quit()
+
+
+# ------------------------------------------------------------ پرداخت اینترنتی
+class PaymentBrowser:
+    """پنجره‌ی مرورگری که کاربر در آن پرداخت را در صفحه‌ی بانک انجام می‌دهد."""
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    def close(self) -> None:
+        try:
+            self.driver.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def open_payment(session: requests.Session, amount: int, username: str, password: str) -> PaymentBrowser:
+    """
+    یک پنجره‌ی Chrome باز می‌کند (با همان کوکی‌های لاگین)، صفحه‌ی «افزایش اعتبار اینترنتی» را باز می‌کند،
+    مبلغ را می‌نویسد و روی درگاه پرداخت کلیک می‌کند. بقیه‌اش (کارت و رمز) را خود کاربر در صفحه‌ی بانک
+    انجام می‌دهد؛ اطلاعات کارت هیچ‌وقت از این برنامه عبور نمی‌کند. پنجره باز می‌ماند تا PaymentBrowser.close().
+    """
+    driver = _new_driver()
+    try:
+        driver.get(BASE_URL)
+        for c in session.cookies:
+            driver.add_cookie({"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)})
+        driver.get(EPAY_URL)
+        if not driver.find_elements(By.ID, "cphMain_txtPaymentAmount"):
+            # کوکی‌ها پذیرفته نشد؛ در همین پنجره لاگین می‌کنیم و کوکی‌های جدید را به session هم می‌دهیم
+            _driver_login(driver, username, password)
+            _cookies_to_session(driver, session)
+            driver.get(EPAY_URL)
+        WebDriverWait(driver, 10).until(lambda d: d.find_elements(By.ID, "cphMain_txtPaymentAmount"))
+        box = driver.find_element(By.ID, "cphMain_txtPaymentAmount")
+        driver.execute_script("arguments[0].value = arguments[1];", box, f"{amount:,}")
+        driver.find_element(By.ID, "cphMain_dataLstBank_imgBankLogo_0").click()
+        return PaymentBrowser(driver)
+    except Exception:
+        driver.quit()
+        raise
 
 
 # ------------------------------------------------------------ پرسش‌ها
@@ -216,7 +268,7 @@ def wait_flow(session, choices, relogin) -> None:
         print(f"\nمتوقف شد. انتخاب‌ها در {PENDING_FILE} ذخیره است.")
 
 
-def mode_reserve(session, relogin) -> None:
+def mode_reserve(session, relogin, username: str, password: str) -> None:
     week = ask_week()
     print("\nدر حال دریافت برنامه غذایی همه‌ی سلف‌ها ...")
     menu = fetch_menu(session, week, all_selves=True, on_progress=show_progress)
@@ -225,7 +277,8 @@ def mode_reserve(session, relogin) -> None:
         print(f"\nبرای این هفته ({menu.week_range}) هنوز غذایی ثبت نشده است.")
         return
     # انتخاب در صفحه‌ی وب انجام می‌شود و بعد از «ثبت نهایی» روی سایت اعمال می‌شود
-    SelectionServer(session, menu, relogin).run()
+    SelectionServer(session, menu, relogin,
+                    pay_opener=lambda sess, amount: open_payment(sess, amount, username, password)).run()
 
 
 def mode_pending(session, relogin) -> None:
@@ -248,18 +301,19 @@ def main() -> None:
     options = ["فقط دریافت منو و ساخت فایل", "انتخاب غذا (در صفحه‌ی وب) و ثبت رزرو"]
     if pending:
         options.append(f"ادامه‌ی انتخاب‌های ذخیره‌شده ({len(pending)} مورد، منتظر موجودی)")
-    mode = choose("\nچه کاری انجام شود؟", options)
+    mode = choose("\nچه کاری انجام شود؟", options, 2)
 
     print("\nدر حال ورود به سامانه ...")
-    session = get_session(username, password)
-    relogin = lambda: get_session(username, password)
+    session = get_session(username, password, True)
+    relogin = lambda: get_session(username, password, True)
     if mode == 1:
         mode_menu_file(session)
     elif mode == 2:
-        mode_reserve(session, relogin)
+        mode_reserve(session, relogin, username, password)
     else:
         mode_pending(session, relogin)
 
 
 if __name__ == "__main__":
     main()
+    

@@ -118,6 +118,15 @@ def _open_week(session, url: str, dates: set) -> str:
     raise LookupError("تاریخ‌های انتخاب‌شده در هفته‌ی جاری و هفته‌ی بعد پیدا نشدند")
 
 
+def read_credit(session, url: str = RESERVATION_URL) -> Optional[int]:
+    """«اعتبار شما» را از صفحه‌ی رزرو می‌خواند (برای پایش پرداخت)."""
+    r = session.get(url)
+    r.raise_for_status()
+    if "txtUsernamePlain" in r.text:
+        raise PermissionError("session لاگین نیست یا منقضی شده")
+    return parse_page(r.text).credit
+
+
 def current_state(session, choices: list[Choice], url: str = RESERVATION_URL) -> WeekMenu:
     """وضعیت فعلی صفحه (اعتبار و رزروها) برای هفته‌ی شامل این انتخاب‌ها."""
     return parse_page(_open_week(session, url, {c.date for c in choices}))

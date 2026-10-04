@@ -53,6 +53,17 @@ class DayEntry:
     reserved: bool
     status: Optional[str]
     selves: list[Self_] = field(default_factory=list)
+    amount: Optional[int] = None                       # مبلغ خریداری‌شده‌ی فعلی (ریال)
+    fields: dict = field(default_factory=dict)          # نام فیلدهای فرم: chk / self / food (برای ثبت رزرو)
+
+    @property
+    def selected_self(self) -> Optional[Self_]:
+        return next((s for s in self.selves if s.selected), None)
+
+    @property
+    def selected_food(self) -> Optional[Food]:
+        s = self.selected_self
+        return next((f for f in s.foods if f.selected), None) if s else None
 
     @property
     def has_food(self) -> bool:
@@ -64,6 +75,8 @@ class Meal:
     key: str    # Breakfast / Lunch / Dinner / ...
     title: str  # عنوان فارسی تب
     days: list[DayEntry] = field(default_factory=list)
+    save_name: Optional[str] = None   # دکمه‌ی «ذخیره»ی همین وعده
+    save_value: Optional[str] = None
 
 
 @dataclass
@@ -71,6 +84,7 @@ class WeekMenu:
     week_range: Optional[str]
     message: Optional[str]  # پیام سامانه (alertBox)، اگر باشد
     meals: list[Meal] = field(default_factory=list)
+    credit: Optional[int] = None  # «اعتبار شما» (ریال)
 
     @property
     def has_food(self) -> bool:
@@ -180,21 +194,31 @@ def _parse_row(tr) -> Optional[DayEntry]:
         selves.append(Self_(o["value"], o.get_text(strip=True), sel, foods if sel else []))
 
     return DayEntry(weekday, date, bool(selves), bool(chk and chk.has_attr("disabled")),
-                    bool(chk and chk.has_attr("checked")), img.get("title") if img else None, selves)
+                    bool(chk and chk.has_attr("checked")), img.get("title") if img else None, selves,
+                    amount=_int(tds[6].get_text()),
+                    fields={"chk": chk.get("name") if chk else None,
+                            "self": self_sel.get("name") if self_sel else None,
+                            "food": food_sel.get("name") if food_sel else None})
 
 
 def parse_page(html: str) -> WeekMenu:
     soup = BeautifulSoup(html, "lxml")
     week = soup.find(id="cphMain_lblWeekDate")
     msg = soup.find(id="cphMain_alertBoxValue")
+    credit = soup.find(id="cphMain_lblCreditValue")
     menu = WeekMenu(
         week_range=" ".join(week.get_text().split()) if week else None,
         message=msg.get_text(strip=True) or None if msg else None,
+        credit=_int(credit.get_text()) if credit else None,
     )
     for table in soup.find_all("table", id=TABLE_ID_RE):
-        label = table.find_parent("li").find("label") if table.find_parent("li") else None
+        li = table.find_parent("li")
+        label = li.find("label") if li else None
         meal = Meal(TABLE_ID_RE.match(table["id"])[1], label.get_text(strip=True) if label else table["id"])
         meal.days = [d for d in map(_parse_row, table.find_all("tr")[1:]) if d]
+        btn = li.find("input", attrs={"type": "submit", "name": re.compile(r"btnSave")}) if li else None
+        if btn:
+            meal.save_name, meal.save_value = btn["name"], btn.get("value", "")
         menu.meals.append(meal)
     return menu
 
@@ -245,7 +269,7 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: str
     all_selves  : غذاهای همه‌ی سلف‌ها (پیش‌فرض True). ردیف‌های قفل‌شده (گذشته/رزرو قطعی)
                   فقط همان غذای رزروشده را دارند، چون سایت اجازه‌ی تغییر سلف در آن‌ها را نمی‌دهد.
     on_progress : تابع اختیاری f(انجام‌شده, کل) برای نمایش پیشرفت
-    threaded    : برای هر روز هفته یک thread (حداکثر ۷ تا)
+    threaded    : برای هر روز هفته یک thread؛ thread روزِ غیرفعال (یا روزی که حین کار غیرفعال شود) همان‌جا تمام می‌شود
     اگر برنامه‌ی هفته‌ی بعد هنوز ثبت نشده باشد، menu.has_food برابر False است.
     """
     if week not in ("current", "next"):
@@ -268,38 +292,48 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: str
 
     soup = BeautifulSoup(html, "lxml")
     payload = _form_payload(soup)  # یک بار؛ برای همه‌ی postbackها مشترک است
-    jobs_by_date: dict[str, list] = {}  # تاریخ -> [(meal, day, نام select سلف, سلف دیگر)]
+    dates = list(dict.fromkeys(d.date for m in menu.meals for d in m.days))
+    jobs_by_date: dict[str, list] = {dt: [] for dt in dates}  # تاریخ -> [(meal, day, نام select سلف, سلف دیگر)]
     for meal in menu.meals:
         table = next(t for t in soup.find_all("table", id=TABLE_ID_RE) if TABLE_ID_RE.match(t["id"])[1] == meal.key)
         for day, tr in zip(meal.days, table.find_all("tr")[1:]):
             if day.active and not day.locked:
                 target = tr.find("select", id=re.compile(r"_drpSelf_\d+$"))["name"]
-                jobs_by_date.setdefault(day.date, []).extend(
-                    (meal, day, target, s) for s in day.selves if not s.selected)
+                jobs_by_date[day.date] += [(meal, day, target, s) for s in day.selves if not s.selected]
 
     total = sum(map(len, jobs_by_date.values()))
     done = 0
     lock = threading.Lock()
 
-    def run_day(jobs):
+    def advance(n: int) -> None:
         nonlocal done
+        with lock:
+            done += n
+            if on_progress:
+                on_progress(done, total)
+
+    def run_day(date: str) -> None:
+        """thread همین روز. اگر روز غیرفعال باشد (یا حین کار غیرفعال شود)، همین‌جا تمام می‌شود."""
+        jobs = jobs_by_date[date]
+        if not jobs:
+            return
         sess = _clone_session(session) if threaded else session
-        for meal, day, target, s in jobs:
+        for i, (meal, day, target, s) in enumerate(jobs):
             page = parse_page(_post(sess, url, payload, __EVENTTARGET=target, __EVENTARGUMENT="", **{target: s.id}))
             d2 = next((d for m in page.meals if m.key == meal.key for d in m.days if d.date == day.date), None)
-            got = next((x for x in d2.selves if x.id == s.id and x.selected), None) if d2 else None
+            if d2 is None or not d2.active:  # روز در پاسخ سایت غیرفعال است؛ بقیه‌ی کارهای این روز لغو می‌شود
+                advance(len(jobs) - i)
+                return
+            got = next((x for x in d2.selves if x.id == s.id and x.selected), None)
             if got:
                 s.foods = got.foods
-            with lock:
-                done += 1
-                if on_progress:
-                    on_progress(done, total)
+            advance(1)
 
-    if threaded and len(jobs_by_date) > 1:
-        with ThreadPoolExecutor(max_workers=len(jobs_by_date)) as ex:
-            for f in [ex.submit(run_day, j) for j in jobs_by_date.values()]:
+    if threaded and len(dates) > 1:
+        with ThreadPoolExecutor(max_workers=len(dates)) as ex:  # برای هر روز یک thread
+            for f in [ex.submit(run_day, dt) for dt in dates]:
                 f.result()  # خطای thread را بالا می‌آورد
     else:
-        for j in jobs_by_date.values():
-            run_day(j)
+        for dt in dates:
+            run_day(dt)
     return menu

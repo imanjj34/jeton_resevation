@@ -27,6 +27,29 @@ FOOD_RE = re.compile(r"^(?P<name>.*?)\s+(?P<price>[\d,٬]+)\s*ریال\s*$")
 PLACEHOLDER = "-1"  # روزهای غیرفعال (جمعه و ...)
 
 
+# سربرگ هر وعده در فایل HTML خروجی (بدون JS همه‌ی وعده‌ها پشت‌سرهم دیده می‌شوند)
+_TABS_JS = """<script>
+(function(){
+  var panels = document.querySelectorAll(".panel"), box = document.getElementById("tabs"), i;
+  if(!panels.length || !box) return;
+  document.body.className += " js";
+  function show(k){
+    for(var j=0;j<panels.length;j++){
+      panels[j].style.display = (j===k) ? "block" : "none";
+      box.children[j].className = "tabbtn" + (j===k ? " on" : "");
+    }
+  }
+  for(i=0;i<panels.length;i++){
+    var b = document.createElement("button"); b.type = "button"; b.className = "tabbtn";
+    b.textContent = panels[i].getAttribute("data-title");
+    b.onclick = (function(k){ return function(){ show(k); }; })(i);
+    box.appendChild(b);
+  }
+  show(0);
+})();
+</script>"""
+
+
 # ----------------------------------------------------------------- مدل‌ها
 @dataclass
 class Food:
@@ -124,6 +147,11 @@ class WeekMenu:
             ".res td.day,.res td.self{background:#e8f5e9}.sel{font-weight:bold}.tick{color:#2e7d32;font-weight:bold}"
             ".self{white-space:nowrap}.price{color:#777;font-size:12px}.food{display:block;margin:3px 0}"
             ".note{background:#fff8e1;border:1px solid #ffe082;padding:10px;border-radius:6px}.legend{color:#666;font-size:12px}"
+            "#tabs{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 0;border-bottom:2px solid #2e7d32}"
+            ".tabbtn{font-family:inherit;font-size:15px;background:#eceff1;color:#333;border:1px solid #cfd8dc;padding:7px 18px;border-radius:8px 8px 0 0;cursor:pointer}"
+            ".tabbtn.on{background:#2e7d32;color:#fff;border-color:#2e7d32}"
+            ".js h2{display:none}"
+            "@media print{#tabs{display:none}.js h2{display:block}.panel{display:block !important}}"
             "</style></head><body>",
             f"<h1>برنامه غذایی هفته <bdi>{e(self.week_range or '')}</bdi></h1>",
         ]
@@ -133,7 +161,9 @@ class WeekMenu:
             parts.append('<p class="note">هنوز غذایی برای این هفته ثبت نشده است.</p>')
         else:
             parts.append('<p class="legend">سبز = رزرو شده &nbsp;|&nbsp; <b>پررنگ</b> با <span class="tick">✓</span> = غذای انتخاب‌شده/پیش‌فرض</p>')
-            for m in self.meals:
+            parts.append('<div id="tabs"></div>')
+            for mi, m in enumerate(self.meals):
+                parts.append(f'<div class="panel" id="panel_{mi}" data-title="{e(m.title)}">')
                 parts.append(f"<h2>{e(m.title)}</h2><table><tr><th>روز</th><th>سلف</th><th>غذاها</th></tr>")
                 for d in m.days:
                     day = f"{e(d.weekday)}<br><small>{e(d.date)}</small>"
@@ -155,7 +185,8 @@ class WeekMenu:
                         )
                         name = f"<b>{e(s.name)}</b>" if s.selected else e(s.name)
                         parts.append(f'<td class="self">{name}</td><td>{foods}</td></tr>')
-                parts.append("</table>")
+                parts.append("</table></div>")
+            parts.append(_TABS_JS)
         parts.append("</body></html>")
         return "\n".join(parts)
 
@@ -337,3 +368,21 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: str
         for dt in dates:
             run_day(dt)
     return menu
+
+
+def fallback_notice(next_menu: WeekMenu, current_menu: WeekMenu) -> str:
+    return (f"منوی هفته بعد ({next_menu.week_range or '؟'}) هنوز غذایی ثبت نشده است؛ "
+            f"منوی هفته جاری ({current_menu.week_range or '؟'}) نمایش داده می‌شود.")
+
+
+def fetch_menu_with_fallback(session, week: str, **kw) -> tuple[WeekMenu, Optional[str]]:
+    """
+    مثل fetch_menu؛ اما اگر «هفته بعد» هنوز غذایی نداشت، بلافاصله منوی «هفته جاری» را می‌گیرد.
+    خروجی: (منو، پیام اطلاع‌رسانی یا None). اگر هر دو هفته خالی باشند، همان منوی خالی‌ی هفته بعد برمی‌گردد.
+    """
+    menu = fetch_menu(session, week, **kw)
+    if week == "next" and not menu.has_food:
+        current = fetch_menu(session, "current", **kw)
+        if current.has_food:
+            return current, fallback_notice(menu, current)
+    return menu, None

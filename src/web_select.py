@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from food_menu import WeekMenu
-from reserve import (Choice, _is_noop, clear_pending, current_state, find_day, find_meal, price_delta,
+from reserve import (Choice, _is_noop, clear_pending, find_day, find_meal, open_week_state, price_delta,
                      read_credit, save_pending, submit, summary_lines)
 
 
@@ -108,6 +108,7 @@ class SelectionServer:
         self.session, self.menu, self._relogin = session, menu, relogin
         self.pay_opener = pay_opener
         self.preselect: dict = {}
+        self.notice: str | None = None  # مثلاً «هفته بعد هنوز غذایی ندارد؛ هفته جاری نمایش داده شد»
         self.pay_browser = None
         self.pay_opening = False  # از لحظه‌ی کلیک تا باز شدن پنجره؛ مانع دو بار باز شدن می‌شود
         self.pending_choices: list[Choice] = []
@@ -156,7 +157,7 @@ class SelectionServer:
             choices = selections_to_choices(self.menu, body.get("selections", []))
             if not choices:
                 return {"state": "nochange"}
-            fresh = self._with_relogin(lambda: current_state(self.session, choices))
+            fresh, html = self._with_relogin(lambda: open_week_state(self.session, choices))
             delta, credit = price_delta(fresh, choices), fresh.credit or 0
             if self.menu:
                 self.menu.credit = credit
@@ -164,17 +165,23 @@ class SelectionServer:
 
             if delta <= credit:
                 self.job.update(job="submitting", log=[], results=None, ok=None, paid=None, pay=None)
-                threading.Thread(target=self._submit_job, args=(choices,), daemon=True).start()
+                threading.Thread(target=self._submit_job, args=(choices, html), daemon=True).start()
                 return {"state": "started", **base}
 
             save_pending(choices)
             self.pending_choices, self.shortfall = choices, delta - credit
             return {"state": "insufficient", "shortfall": self.shortfall, "canPay": self.pay_opener is not None, **base}
 
-    def _submit_job(self, choices: list[Choice]) -> None:
-        """ثبت مرحله‌به‌مرحله روی سایت؛ پیشرفت زنده از طریق self.job['log'] به صفحه می‌رسد."""
+    def _submit_job(self, choices: list[Choice], html: str | None = None) -> None:
+        """ثبت مرحله‌به‌مرحله روی سایت؛ پیشرفت زنده از طریق self.job['log'] به صفحه می‌رسد.
+        html: صفحه‌ی هفته که همین لحظه باز شده (دوباره باز نمی‌شود). بعد از ورود دوباره دیگر معتبر نیست."""
+        first = [html]
+
+        def run():
+            h, first[0] = first[0], None
+            return submit(self.session, choices, on_step=self._log, html=h)
         try:
-            results = self._with_relogin(lambda: submit(self.session, choices, on_step=self._log))
+            results = self._with_relogin(run)
         except Exception as e:  # noqa: BLE001
             self._log(f"خطا: {type(e).__name__}: {e}")
             results = [{"meal": "-", "ok": False, "message": None, "problems": [f"{type(e).__name__}: {e}"]}]
@@ -258,8 +265,9 @@ class SelectionServer:
         # فقط یک بار، بعد از برگشت از بانک، اعتبار از سایت خوانده می‌شود
         before = self.menu.credit if self.menu else None
         try:
+            html = None
             if choices:
-                fresh = self._with_relogin(lambda: current_state(self.session, choices))
+                fresh, html = self._with_relogin(lambda: open_week_state(self.session, choices))
                 credit, delta = fresh.credit or 0, price_delta(fresh, choices)
             else:
                 credit, delta = self._with_relogin(lambda: read_credit(self.session)), 0
@@ -273,7 +281,7 @@ class SelectionServer:
         self._log(f"اعتبار پس از پرداخت: {credit:,} ریال")
         if choices and delta <= credit:
             self.job.update(job="submitting", paid=paid)
-            self._submit_job(choices)
+            self._submit_job(choices, html)
         else:
             self.job.update(job="paid", paid=paid)
             if choices:
@@ -290,6 +298,7 @@ class SelectionServer:
     def page(self) -> bytes:
         d = build_data(self.menu, self.preselect)
         d["canPay"] = self.pay_opener is not None
+        d["notice"] = self.notice
         data = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
         return PAGE.replace("__DATA__", data).replace("__TOKEN__", self.token).encode("utf-8")
 
@@ -386,7 +395,11 @@ PAGE = r"""<!DOCTYPE html>
 <title>انتخاب غذا</title>
 <style>
 body{font-family:Vazirmatn,Tahoma,sans-serif;max-width:960px;margin:0 auto;padding:12px 12px 230px;color:#222;background:#fff}
-h1{font-size:20px;margin:8px 0}h2{font-size:17px;margin:26px 0 8px;border-right:4px solid #2e7d32;padding-right:8px}
+h1{font-size:20px;margin:8px 0}
+#tabs{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 0;position:sticky;top:0;background:#fff;padding:6px 0;z-index:5;border-bottom:2px solid #2e7d32}
+.tabbtn{background:#eceff1;color:#333;border:1px solid #cfd8dc;padding:7px 18px;border-radius:8px 8px 0 0;font-size:15px}
+.tabbtn.on{background:#2e7d32;color:#fff;border-color:#2e7d32}.tabbtn .n{background:#ffb300;color:#222;border-radius:9px;padding:0 7px;font-size:12px;margin-right:6px}
+.panel{margin-top:10px}
 table{width:100%;border-collapse:collapse}td{border:1px solid #ccc;padding:6px 8px;vertical-align:top;text-align:right}
 td.day{white-space:nowrap;font-weight:bold;width:1%;background:#f6f6f6}td.day small{font-weight:normal;color:#666}
 .badge{display:inline-block;background:#e8f5e9;color:#1b5e20;border-radius:4px;padding:0 6px;font-size:12px;margin-top:4px}
@@ -417,6 +430,7 @@ button.small{font-size:12px;padding:3px 10px}#numsrow{display:flex;align-items:c
  <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار اینترنتی» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از برگشت از بانک، نتیجه‌ی تراکنش و اعتبار جدید همین‌جا اعلام می‌شود (رزروی انجام نمی‌شود).</div></div>
 </details>
 <div id="out"></div>
+<div id="tabs"></div>
 <div id="meals"></div>
 <div id="bar"><div class="in">
  <div id="numsrow"><span id="nums"></span> <button id="refreshcredit" class="sec small" title="خواندن دوباره‌ی موجودی از سایت">بروزرسانی موجودی</button></div>
@@ -439,9 +453,13 @@ function sgn(n){ return (n<0?"-":(n>0?"+":"")) + fmt(n); }
 
 function build(){
   document.getElementById("week").textContent = DATA.week || "";
-  var root = document.getElementById("meals");
-  DATA.meals.forEach(function(meal){
-    root.appendChild(h("h2", "", meal.title));
+  var root = document.getElementById("meals"), tabs = document.getElementById("tabs");
+  DATA.meals.forEach(function(meal, mi){
+    var panel = h("div", "panel"), btn = h("button", "tabbtn");
+    panel.id = "panel_" + mi; panel.style.display = "none";
+    btn.type = "button"; btn.id = "tab_" + mi; btn.setAttribute("data-title", meal.title); btn.textContent = meal.title;
+    btn.onclick = (function(i){ return function(){ showTab(i); }; })(mi);
+    tabs.appendChild(btn); root.appendChild(panel);
     var table = h("table"), tb = h("tbody");
     meal.days.forEach(function(day){
       var tr = h("tr"), dayTd = h("td", "day"), opts = h("td", "opts");
@@ -486,14 +504,29 @@ function build(){
       });
       var pv = DATA.preselect && DATA.preselect[meal.key + "|" + day.date];
       if(pv){
-        var els = document.getElementsByName(name), has = false, k;
+        var els = opts.getElementsByTagName("input"), has = false, k;  // جدول هنوز به صفحه وصل نشده؛ داخل همین ردیف جست‌وجو می‌کنیم
         for(k=0;k<els.length;k++) if(els[k].value===pv) has = true;
         if(has){ for(k=0;k<els.length;k++) els[k].checked = (els[k].value===pv); preApplied++; }
       }
       rows.push(info);
     });
-    table.appendChild(tb); root.appendChild(table);
+    table.appendChild(tb); panel.appendChild(table);
   });
+  // تب اولی که روزِ قابل‌ویرایش دارد باز می‌شود
+  var first = 0, i, j;
+  for(i=0;i<DATA.meals.length;i++){
+    var ok = false;
+    for(j=0;j<DATA.meals[i].days.length;j++){ var d = DATA.meals[i].days[j]; if(d.active && !d.locked && d.selves.length) ok = true; }
+    if(ok){ first = i; break; }
+  }
+  showTab(first);
+}
+
+function showTab(k){
+  for(var i=0;i<DATA.meals.length;i++){
+    document.getElementById("panel_" + i).style.display = (i===k) ? "block" : "none";
+    document.getElementById("tab_" + i).className = "tabbtn" + (i===k ? " on" : "");
+  }
 }
 
 function current(info){
@@ -503,7 +536,7 @@ function current(info){
 }
 
 function calc(){
-  var delta=0, list=[];
+  var delta=0, list=[], byMeal = {};
   rows.forEach(function(r){
     var v = current(r), old = r.day.reserved ? r.day.amount : 0, nw;
     var labels = r.tr.getElementsByTagName("label");
@@ -511,9 +544,10 @@ function calc(){
     if(v===r.initial) return;
     nw = (v==="none") ? 0 : r.prices[v];
     delta += nw - old;
+    byMeal[r.meal.key] = (byMeal[r.meal.key] || 0) + 1;
     list.push(r.day.weekday + " " + r.day.date + " - " + r.meal.title + ": " + (v==="none" ? "لغو رزرو" : r.labels[v]));
   });
-  return {delta: delta, list: list};
+  return {delta: delta, list: list, byMeal: byMeal};
 }
 
 function refresh(){
@@ -525,6 +559,11 @@ function refresh(){
   item("موجودی فعلی", fmt(credit) + " ریال", "");
   item("پس از ثبت", (after<0?"-":"") + fmt(after) + " ریال", after<0 ? "bad":"good");
   if(short>0) item("کمبود", fmt(short) + " ریال", "bad");
+  DATA.meals.forEach(function(m, i){  // شمارنده‌ی تغییرات هر سربرگ (تغییرِ تب‌های بسته هم دیده شود)
+    var b = document.getElementById("tab_" + i), n = c.byMeal[m.key] || 0;
+    b.textContent = m.title;
+    if(n){ b.appendChild(h("span", "n", String(n))); }
+  });
   var ul = document.getElementById("chg"); ul.innerHTML="";
   c.list.forEach(function(t){ ul.appendChild(h("li","",t)); });
   document.getElementById("go").disabled = busy || c.list.length===0;
@@ -640,6 +679,6 @@ document.getElementById("refreshcredit").onclick = function(){
 };
 if(DATA.canPay) document.getElementById("topup").style.display="block";
 build(); refresh();
-if(preApplied>0) show("info", "انتخاب‌های ذخیره‌شده‌ی قبلی (" + preApplied + " مورد) اعمال شد؛ بررسی کن و «ثبت نهایی» را بزن.");
+if(DATA.notice || preApplied>0) show("info", (DATA.notice ? DATA.notice + "\n" : "") + (preApplied>0 ? ("انتخاب‌های ذخیره‌شده‌ی قبلی (" + preApplied + " مورد) اعمال شد؛ بررسی کن و «ثبت نهایی» را بزن.") : ""));
 </script></body></html>
 """

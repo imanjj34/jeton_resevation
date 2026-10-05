@@ -11,11 +11,14 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 
+from food_menu import fallback_notice
 from web_select import SelectionServer
 from reserve import PENDING_FILE, Choice, load_pending
 
 MODES = ("reserve", "file", "pending")
+PREFETCH_MAX_AGE = 600  # ثانیه؛ منوی پیش‌دریافت‌شده‌ی کهنه‌تر از این دور ریخته می‌شود
 
 
 def choices_to_preselect(choices: list[Choice]) -> dict:
@@ -31,19 +34,27 @@ class AppServer(SelectionServer):
         fetch(session, week, on_progress) -> WeekMenu         (دریافت منو با غذاهای همه‌ی سلف‌ها)
         relogin() -> requests.Session                         (ورود دوباره با همان اطلاعات)
         dataset_ok() -> bool / set_dataset(path)              (پوشه‌ی دیتاست کپچا)
+
+        ورود در پس‌زمینه انجام می‌شود و صفحه همان لحظه مرحله‌ی «انتخاب کار» را نشان می‌دهد (بدون انتظار و بدون تأیید).
+        اگر نام کاربری/رمز در محیط تنظیم باشد، ورود حتی قبل از باز شدن صفحه شروع می‌شود.
+        بعد از ورود، منوی هفته‌ی پیش‌فرض هم در پس‌زمینه دریافت می‌شود تا موقع «ادامه» آماده باشد.
         """
         super().__init__(None, None, relogin, pay_opener)
         self._login, self._fetch = login, fetch
         self._env = (env_user, env_pass) if env_user and env_pass else None
         self._dataset_ok, self._set_dataset = dataset_ok, set_dataset
         self.defaults = {"mode": default_mode, "week": default_week}
-        self.stage = "login"      # login -> home -> select
+        self.stage = "login"      # login (نیاز به اطلاعات) -> home (ورود شروع شده) -> select
         self.file_blob = None     # (بایت‌ها، content-type) آخرین فایل منو
+        self.bg = {"login": "idle", "login_error": None, "prefetch": "idle", "progress": None, "week": None, "fallback": False}
+        self._login_done, self._pf_done = threading.Event(), threading.Event()
+        self._login_error = None
+        self._pf_menus, self._pf_week, self._pf_time = {}, None, 0.0
         self.job.update(error=None, progress=None, file=None)
 
     # -- وضعیت برای صفحه
     def status(self) -> dict:
-        return {**self.job, "stage": self.stage, "env_user": self._env[0] if self._env else None,
+        return {**self.job, "stage": self.stage, "bg": self.bg, "env_user": self._env[0] if self._env else None,
                 "need_dataset": bool(self._dataset_ok and not self._dataset_ok()),
                 "has_pending": bool(load_pending()), "defaults": self.defaults}
 
@@ -59,15 +70,30 @@ class AppServer(SelectionServer):
         return WIZARD.replace("__TOKEN__", self.token).encode("utf-8")
 
     def _progress(self, n: int, total: int) -> None:
+        self.bg["progress"] = f"{n}/{total}"
         self.job["progress"] = f"{n}/{total}"
 
     def _fail(self, text: str) -> None:
         self._log(text)
         self.job.update(job="idle", error=text, progress=None)
 
-    # -- مرحله‌ی ۱: ورود
+    def run(self, launch: bool = True) -> None:
+        # با اطلاعات محیط، ورود قبل از باز شدن صفحه شروع می‌شود (نیازی به کلیک نیست)
+        if self._env and not (self._dataset_ok and not self._dataset_ok()):
+            self.begin_login(*self._env)
+        super().run(launch)
+
+    # -- مرحله‌ی ۱: ورود (در پس‌زمینه؛ صفحه منتظرش نمی‌ماند)
+    def begin_login(self, user: str, pw: str) -> None:
+        self._login_done.clear()
+        self._pf_done.clear()
+        self._login_error, self._pf_menus, self._pf_week = None, {}, None
+        self.bg.update(login="working", login_error=None, prefetch="idle", progress=None, week=None, fallback=False)
+        self.stage = "home"
+        threading.Thread(target=self._login_job, args=(user, pw), daemon=True).start()
+
     def api_login(self, body: dict) -> dict:
-        if self.job["job"] == "working" or self.stage != "login":
+        if self.stage != "login" or self.bg["login"] == "working":
             return {"state": "error", "message": "ورود در حال انجام است یا قبلاً انجام شده."}
         if self._env and body.get("useenv"):
             user, pw = self._env
@@ -82,20 +108,43 @@ class AppServer(SelectionServer):
             self._set_dataset(dataset)
         elif self._dataset_ok and not self._dataset_ok():
             return {"state": "error", "message": "مسیر پوشه‌ی دیتاست کپچا را وارد کن."}
-        self.job.update(job="working", log=[], error=None, progress=None, file=None)
-        threading.Thread(target=self._login_job, args=(user, pw), daemon=True).start()
-        return {"state": "working"}
+        self.job.update(error=None)
+        self.begin_login(user, pw)
+        return {"state": "working", "stage": self.stage}
 
     def _login_job(self, user: str, pw: str) -> None:
         self._log("در حال ورود به سامانه (مرورگر مخفی + تشخیص کپچا) ...")
         try:
             self.session = self._login(user, pw)
         except Exception as e:  # noqa: BLE001
-            self._fail(f"ورود ناموفق: {e}")
+            self._login_error = f"ورود ناموفق: {e}"
+            self.bg.update(login="error", login_error=self._login_error)
+            self.stage = "login"  # دوباره فرم ورود با پیام خطا
+            self._log(self._login_error)
+            self._login_done.set()
+            self._pf_done.set()
             return
-        self.stage = "home"
+        self.bg["login"] = "done"
         self._log("ورود موفق ✓")
-        self.job.update(job="idle")
+        self._login_done.set()
+        # منوی هفته‌ی پیش‌فرض را همین حالا (همزمان با تصمیم‌گیری کاربر) دریافت کن؛
+        # اگر هفته‌ی بعد هنوز غذایی نداشت، بلافاصله هفته‌ی جاری را هم بگیر
+        if self.defaults["mode"] in ("reserve", "file"):
+            week = self.defaults["week"]
+            self._pf_week = week
+            self.bg.update(prefetch="working", week=week, progress=None)
+            try:
+                menu = self._fetch(self.session, week, self._progress)
+                self._pf_menus[week] = menu
+                if week == "next" and not menu.has_food:
+                    self.bg.update(fallback=True, progress=None)
+                    self._log("هفته بعد هنوز غذایی ندارد؛ در حال دریافت هفته جاری ...")
+                    self._pf_menus["current"] = self._fetch(self.session, "current", self._progress)
+                self._pf_time = time.time()
+                self.bg["prefetch"] = "done"
+            except Exception:  # noqa: BLE001  (بعداً در پیش‌زمینه دوباره امتحان می‌شود)
+                self.bg["prefetch"] = "error"
+        self._pf_done.set()
 
     # -- مرحله‌ی ۲ و ۳: انتخاب کار، دریافت منو
     def api_start(self, body: dict) -> dict:
@@ -111,20 +160,54 @@ class AppServer(SelectionServer):
         threading.Thread(target=self._start_job, args=(mode, week, name), daemon=True).start()
         return {"state": "working"}
 
-    def _fetch_week(self, week: str):
-        title = "هفته جاری" if week == "current" else "هفته بعد"
-        self._log(f"در حال دریافت منوی {title} (غذاهای همه‌ی سلف‌ها) ...")
-        return self._with_relogin(lambda: self._fetch(self.session, week, self._progress))
+    def _title(self, week: str) -> str:
+        return "هفته جاری" if week == "current" else "هفته بعد"
+
+    def _take_prefetched(self, week: str):
+        """منوی پیش‌دریافت‌شده‌ی همین هفته (اگر تازه باشد). فقط یک بار مصرف می‌شود."""
+        # هفته‌ی جاری فقط وقتی «پیش‌دریافت» حساب می‌شود که جایگزینِ هفته‌ی بعدِ خالی شروع شده باشد
+        if week != self._pf_week and not (week == "current" and self._pf_week == "next" and self.bg.get("fallback")):
+            return None
+        if not self._pf_done.is_set():
+            self._log(f"منوی {self._title(week)} در پس‌زمینه در حال دریافت است؛ منتظر تکمیلش می‌مانم ...")
+        self._pf_done.wait()
+        menu = self._pf_menus.pop(week, None)
+        if menu is not None and time.time() - self._pf_time < PREFETCH_MAX_AGE:
+            self._log(f"منوی {self._title(week)} آماده بود ✓")
+            return menu
+        return None
+
+    def _get_week(self, week: str):
+        menu = self._take_prefetched(week)
+        if menu is None:
+            self._log(f"در حال دریافت منوی {self._title(week)} (غذاهای همه‌ی سلف‌ها) ...")
+            menu = self._with_relogin(lambda: self._fetch(self.session, week, self._progress))
+        return menu
+
+    def _fetch_week(self, week: str, fallback: bool = True):
+        """(منو، پیام). اگر هفته‌ی بعد هنوز غذایی ندارد، فوراً منوی هفته‌ی جاری را می‌دهد (با پیام اطلاع‌رسانی)."""
+        menu = self._get_week(week)
+        if fallback and week == "next" and not menu.has_food:
+            self._log("هفته بعد هنوز غذایی ندارد؛ منوی هفته جاری را می‌گیرم ...")
+            current = self._get_week("current")
+            if current.has_food:
+                return current, fallback_notice(menu, current)
+        return menu, None
 
     def _start_job(self, mode: str, week: str, filename: str) -> None:
         try:
-            preselect = {}
+            if not self._login_done.is_set():
+                self._log("منتظر پایان ورود ...")
+            self._login_done.wait()
+            if self._login_error:
+                return self._fail(self._login_error)
+            preselect, notice = {}, None
             if mode == "pending":
                 pend = load_pending()
                 dates = {c.date for c in pend}
                 menu = None
                 for wk in ("current", "next"):  # هفته‌ای که تاریخ‌های ذخیره‌شده در آن است
-                    m = self._fetch_week(wk)
+                    m, _ = self._fetch_week(wk, fallback=False)
                     if dates <= {d.date for ms in m.meals for d in ms.days}:
                         menu = m
                         break
@@ -132,7 +215,9 @@ class AppServer(SelectionServer):
                     return self._fail("تاریخ‌های انتخاب‌های ذخیره‌شده در هفته‌ی جاری و بعد پیدا نشد.")
                 preselect = choices_to_preselect(pend)
             else:
-                menu = self._fetch_week(week)
+                menu, notice = self._fetch_week(week)
+                if notice:
+                    self._log(notice)
             self._log(f"هفته: {menu.week_range}")
             if not menu.has_food:
                 return self._fail(f"برای این هفته ({menu.week_range}) هنوز غذایی ثبت نشده است."
@@ -151,11 +236,11 @@ class AppServer(SelectionServer):
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(content)
                 self.file_blob = (content.encode("utf-8"), ctype)
-                self.job.update(job="idle", progress=None, file={"path": os.path.abspath(filename), "name": filename})
+                self.job.update(job="idle", progress=None, file={"path": os.path.abspath(filename), "name": filename, "notice": notice})
                 self._log(f"ذخیره شد: {os.path.abspath(filename)}")
                 return
 
-            self.menu, self.preselect = menu, preselect
+            self.menu, self.preselect, self.notice = menu, preselect, notice
             self.stage = "select"
             self.job.update(job="idle", progress=None)
         except Exception as e:  # noqa: BLE001
@@ -169,19 +254,23 @@ WIZARD = r"""<!DOCTYPE html>
 <style>
 body{font-family:Vazirmatn,Tahoma,sans-serif;max-width:560px;margin:40px auto;padding:0 14px;color:#222}
 h1{font-size:21px}.card{border:1px solid #ccc;border-radius:10px;padding:16px 18px;margin:14px 0;background:#fafafa}
-label.row{display:table;width:100%;margin:8px 0;cursor:pointer}.rc{display:table-cell;width:26px;vertical-align:top;padding-top:2px}.tc{display:table-cell;vertical-align:top}input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:8px;font-size:15px;margin:4px 0 10px}
+label.row{display:table;width:100%;margin:8px 0;cursor:pointer}.rc{display:table-cell;width:26px;vertical-align:top;padding-top:2px}.tc{display:table-cell;vertical-align:top}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:8px;font-size:15px;margin:4px 0 10px}
 button{font-family:inherit;font-size:15px;padding:9px 22px;border:0;border-radius:6px;background:#2e7d32;color:#fff;cursor:pointer}
-button:disabled{background:#aaa}button.sec{background:#757575}.hint{color:#666;font-size:12px}
+button:disabled{background:#aaa}.hint{color:#666;font-size:12px}
+#bg{margin:8px 0;padding:8px 12px;border-radius:6px;background:#fff8e1;border:1px solid #ffe082;font-size:13px;display:none}#bg.done{background:#e8f5e9;border-color:#a5d6a7}
 #log{white-space:pre-wrap;line-height:1.8;font-size:14px;margin-top:10px}.err{background:#ffebee;border:1px solid #ef9a9a;padding:10px;border-radius:6px;margin:10px 0}
-.ok{background:#e8f5e9;border:1px solid #a5d6a7;padding:10px;border-radius:6px;margin:10px 0}.steps{color:#888;font-size:13px;display:flex;gap:14px;flex-wrap:wrap}.steps b{color:#2e7d32}
+.ok{background:#e8f5e9;border:1px solid #a5d6a7;padding:10px;border-radius:6px;margin:10px 0}
+.steps{color:#888;font-size:13px;display:flex;gap:14px;flex-wrap:wrap}.steps b{color:#2e7d32}
 </style></head><body>
 <h1>سامانه‌ی تغذیه</h1>
 <div class="steps" id="steps"></div>
+<div id="bg"></div>
 <div id="err" class="err" style="display:none"></div>
 <div id="view"></div>
 <div id="log"></div>
 <script>
-var TOKEN = "__TOKEN__", T = (location.search.match(/[?&]t=([^&]+)/) || [0, TOKEN])[1], poll = null, S = null;
+var TOKEN = "__TOKEN__", T = (location.search.match(/[?&]t=([^&]+)/) || [0, TOKEN])[1], shown = null, last = null;
 function h(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e; }
 function api(method, path, body, cb){
   var x = new XMLHttpRequest(); x.open(method, path); x.setRequestHeader("X-Token", TOKEN); x.setRequestHeader("Content-Type","application/json");
@@ -207,7 +296,7 @@ function renderLogin(st){
   var c = h("div","card"); c.appendChild(h("div","","ورود به سامانه"));
   var u, p, d;
   if(st.env_user){
-    c.appendChild(h("p","hint","با اطلاعات تنظیم‌شده در محیط (کاربر: " + st.env_user + ") وارد می‌شوم."));
+    c.appendChild(h("p","hint","اطلاعات ورود در محیط تنظیم شده است (کاربر: " + st.env_user + ")."));
   } else {
     c.appendChild(h("div","hint","نام کاربری")); u = h("input"); u.type="text"; c.appendChild(u);
     c.appendChild(h("div","hint","رمز عبور (فقط به همین برنامه‌ی محلی می‌رسد)")); p = h("input"); p.type="password"; c.appendChild(p);
@@ -215,63 +304,83 @@ function renderLogin(st){
   if(st.need_dataset){
     c.appendChild(h("div","hint","مسیر پوشه‌ی دیتاست کپچا")); d = h("input"); d.type="text"; c.appendChild(d);
   }
-  var b = h("button","","ورود"); c.appendChild(b); v.appendChild(c);
-  b.onclick = function(){
+  var b = h("button","", st.env_user ? "ورود دوباره" : "ورود"); c.appendChild(b); v.appendChild(c);
+  function go(){
     showErr(""); b.disabled = true;
     api("POST","/api/login", {useenv: !!st.env_user, username: u?u.value:"", password: p?p.value:"", dataset: d?d.value:""}, function(j){
-      if(j.state==="working") startPoll(); else { showErr(j.message); b.disabled=false; }
+      if(j.state==="working"){ shown = null; tick(); }  // بلافاصله مرحله‌ی بعد؛ ورود در پس‌زمینه ادامه دارد
+      else { showErr(j.message); b.disabled=false; }
     });
-  };
+  }
+  b.onclick = go;
+  if(p) p.onkeydown = function(e){ if(e.keyCode===13) go(); };
 }
 
 function renderHome(st){
   setSteps(2);
   var v = document.getElementById("view"); v.innerHTML = "";
+  var dm = last ? last.mode : st.defaults.mode, dw = last ? last.week : st.defaults.week, df = last ? last.filename : "menu.html";
   var c = h("div","card"); c.appendChild(h("div","","چه کاری انجام شود؟"));
-  c.appendChild(radio("mode","reserve","مشاهده‌ی منو، انتخاب غذا و ثبت رزرو", st.defaults.mode==="reserve"));
-  c.appendChild(radio("mode","file","فقط دریافت منو و ساخت فایل", st.defaults.mode==="file"));
-  if(st.has_pending) c.appendChild(radio("mode","pending","ادامه‌ی انتخاب‌های ذخیره‌شده (بعد از شارژ موجودی)", st.defaults.mode==="pending"));
+  c.appendChild(radio("mode","reserve","مشاهده‌ی منو، انتخاب غذا و ثبت رزرو", dm==="reserve"));
+  c.appendChild(radio("mode","file","فقط دریافت منو و ساخت فایل", dm==="file"));
+  if(st.has_pending) c.appendChild(radio("mode","pending","ادامه‌ی انتخاب‌های ذخیره‌شده (بعد از شارژ موجودی)", dm==="pending"));
   var weekBox = h("div"); weekBox.appendChild(h("div","","کدام هفته؟"));
-  weekBox.appendChild(radio("week","current","هفته جاری", st.defaults.week==="current"));
-  weekBox.appendChild(radio("week","next","هفته بعد (برای رزرو)", st.defaults.week==="next"));
+  weekBox.appendChild(radio("week","current","هفته جاری", dw==="current"));
+  weekBox.appendChild(radio("week","next","هفته بعد (برای رزرو)", dw==="next"));
   c.appendChild(weekBox);
   var fileBox = h("div"); fileBox.appendChild(h("div","hint","نام فایل (پسوند: .html یا .json یا .txt)"));
-  var fn = h("input"); fn.type="text"; fn.value="menu.html"; fileBox.appendChild(fn); c.appendChild(fileBox);
+  var fn = h("input"); fn.type="text"; fn.value=df; fileBox.appendChild(fn); c.appendChild(fileBox);
   function sync(){ var m = val("mode"); weekBox.style.display = m==="pending" ? "none" : "block"; fileBox.style.display = m==="file" ? "block" : "none"; }
   var rs = document.getElementsByName("mode"); for(var i=0;i<rs.length;i++) rs[i].onchange = sync; sync();
   var b = h("button","","ادامه"); c.appendChild(b); v.appendChild(c);
   if(st.file){
     var ok = h("div","ok"); ok.appendChild(document.createTextNode("ذخیره شد: " + st.file.path + "  "));
-    var a = h("a","","باز کردن در مرورگر"); a.href = "/file?t=" + encodeURIComponent(T); a.target = "_blank"; ok.appendChild(a); v.appendChild(ok);
+    var a = h("a","","باز کردن در مرورگر"); a.href = "/file?t=" + encodeURIComponent(T); a.target = "_blank"; ok.appendChild(a);
+    if(st.file.notice) ok.appendChild(h("div","hint",st.file.notice));
+    v.appendChild(ok);
   }
   b.onclick = function(){
     showErr(""); b.disabled = true;
-    api("POST","/api/start",{mode: val("mode"), week: val("week"), filename: fn.value}, function(j){
-      if(j.state==="working") startPoll(); else { showErr(j.message); b.disabled=false; }
+    last = {mode: val("mode"), week: val("week"), filename: fn.value};
+    api("POST","/api/start", last, function(j){
+      if(j.state==="working"){ shown = null; tick(); } else { showErr(j.message); b.disabled=false; }
     });
   };
 }
 
+function banner(st){
+  var b = document.getElementById("bg"), g = st.bg || {}, t = "", done = false;
+  if(st.stage==="home" || st.job==="working"){
+    if(g.login==="working") t = "در حال ورود به سامانه در پس‌زمینه ... می‌توانی همین حالا انتخاب‌هایت را بزنی.";
+    else if(g.login==="done"){
+      done = true; t = "ورود موفق ✓";
+      if(g.prefetch==="working") t += g.fallback
+          ? " — هفته بعد هنوز غذایی ندارد؛ در حال دریافت منوی هفته جاری" + (g.progress ? " (" + g.progress + ")" : "") + " ..."
+          : " — در حال دریافت منوی " + (g.week==="next" ? "هفته بعد" : "هفته جاری") + " در پس‌زمینه" + (g.progress ? " (" + g.progress + ")" : "") + " ...";
+      else if(g.prefetch==="done") t += g.fallback ? " — هفته بعد هنوز غذایی ندارد؛ منوی هفته جاری آماده است ✓" : " — منو آماده است ✓";
+    }
+  }
+  b.style.display = t ? "block" : "none"; b.className = done ? "done" : ""; b.textContent = t;
+}
+
 function render(st){
-  S = st;
-  showErr(st.error);
-  var lg = document.getElementById("log");
-  lg.textContent = (st.log||[]).join("\n") + (st.progress ? ("\n" + st.progress) : "");
-  if(st.stage==="select"){ location.reload(); return; }
-  if(st.job==="working"){ setSteps(st.stage==="login" ? 1 : 3); document.getElementById("view").innerHTML = ""; return; }
-  if(st.stage==="login") renderLogin(st); else renderHome(st);
+  showErr(st.error || (st.stage==="login" ? (st.bg||{}).login_error : null));
+  banner(st);
+  document.getElementById("log").textContent = st.job==="working" ? ((st.log||[]).join("\n") + (st.progress ? ("\n" + st.progress) : "")) : "";
+  if(st.stage==="select"){ location.reload(); return false; }
+  var want = st.job==="working" ? "busy" : st.stage;
+  if(want!==shown){  // فرم فقط وقتی مرحله عوض شد دوباره ساخته می‌شود (انتخاب‌های کاربر پاک نشود)
+    shown = want;
+    if(want==="busy"){ document.getElementById("view").innerHTML = ""; setSteps(3); }
+    else if(want==="login") renderLogin(st); else renderHome(st);
+  }
+  return true;
 }
 
-function startPoll(){
-  if(poll) clearInterval(poll);
-  poll = setInterval(function(){
-    api("GET","/api/status",null,function(st){
-      render(st);
-      if(st.job!=="working" || st.stage==="select"){ clearInterval(poll); }
-    });
-  }, 1000);
+var timer = null;
+function tick(){
+  api("GET","/api/status",null,function(st){ if(!render(st) && timer){ clearInterval(timer); timer = null; } });
 }
-
-api("GET","/api/status",null,function(st){ render(st); if(st.job==="working") startPoll(); });
+timer = setInterval(tick, 1000); tick();
 </script></body></html>
 """

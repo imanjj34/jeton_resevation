@@ -125,9 +125,15 @@ def read_credit(session, url: str = RESERVATION_URL) -> Optional[int]:
     return parse_page(r.text).credit
 
 
+def open_week_state(session, choices: list[Choice], url: str = RESERVATION_URL) -> tuple[WeekMenu, str]:
+    """صفحه‌ی هفته‌ی شامل این انتخاب‌ها را یک بار باز می‌کند؛ (وضعیت، html) برمی‌گرداند. html را می‌شود به submit داد."""
+    html = _open_week(session, url, {c.date for c in choices})
+    return parse_page(html), html
+
+
 def current_state(session, choices: list[Choice], url: str = RESERVATION_URL) -> WeekMenu:
     """وضعیت فعلی صفحه (اعتبار و رزروها) برای هفته‌ی شامل این انتخاب‌ها."""
-    return parse_page(_open_week(session, url, {c.date for c in choices}))
+    return open_week_state(session, choices, url)[0]
 
 
 def _apply_row(session, url, html, ticks, ch, say):
@@ -179,7 +185,8 @@ def _row_ok(menu: WeekMenu, ch: Choice) -> bool:
                 and d.selected_self.id == ch.self_id and d.selected_food.id == ch.food_id)
 
 
-def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: Optional[Callable[[str], None]] = None) -> list[dict]:
+def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: Optional[Callable[[str], None]] = None,
+           html: Optional[str] = None) -> list[dict]:
     """
     ثبت انتخاب‌ها روی سایت، وعده به وعده و مرحله به مرحله:
         برای هر روزِ یک وعده: انتخاب سلف ← انتخاب غذا ← تیک رزرو
@@ -187,11 +194,13 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
         سپس وعده‌ی بعدی.
     ردیفی که سلف/غذایش تأیید نشود هرگز تیک نمی‌خورد، پس غذای اشتباه رزرو نمی‌شود.
     on_step(متن) برای نمایش زنده‌ی پیشرفت صدا زده می‌شود.
+    html: اگر صفحه‌ی هفته همین چند لحظه پیش با open_week_state باز شده، همان را بده تا دوباره باز نشود (سریع‌تر).
     خروجی: برای هر وعده {meal, ok, message, problems, credit}. ok فقط وقتی True است که صفحه‌ی برگشتی
     دقیقاً همان وضعیت خواسته‌شده را نشان بدهد.
     """
     say = on_step or (lambda _m: None)
-    html = _open_week(session, url, {c.date for c in choices})
+    if html is None:
+        html = _open_week(session, url, {c.date for c in choices})
     results = []
     for meal_key in dict.fromkeys(c.meal for c in choices):
         chs = [c for c in choices if c.meal == meal_key]

@@ -14,6 +14,7 @@ import threading
 import time
 
 from food_menu import fallback_notice
+from ui import BASE_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
 from web_select import SelectionServer
 from reserve import PENDING_FILE, Choice, load_pending
 
@@ -28,7 +29,8 @@ def choices_to_preselect(choices: list[Choice]) -> dict:
 
 class AppServer(SelectionServer):
     def __init__(self, login, fetch, relogin, pay_opener=None, env_user=None, env_pass=None,
-                 dataset_ok=None, set_dataset=None, default_mode="reserve", default_week="next"):
+                 dataset_ok=None, set_dataset=None, default_mode="reserve", default_week="next",
+                 close_pay_window=False, exit_when_done=False):
         """
         login(username, password) -> requests.Session        (ورود و کپچا)
         fetch(session, week, on_progress) -> WeekMenu         (دریافت منو با غذاهای همه‌ی سلف‌ها)
@@ -39,7 +41,8 @@ class AppServer(SelectionServer):
         اگر نام کاربری/رمز در محیط تنظیم باشد، ورود حتی قبل از باز شدن صفحه شروع می‌شود.
         بعد از ورود، منوی هفته‌ی پیش‌فرض هم در پس‌زمینه دریافت می‌شود تا موقع «ادامه» آماده باشد.
         """
-        super().__init__(None, None, relogin, pay_opener)
+        super().__init__(None, None, relogin, pay_opener, refetch=fetch,
+                         close_pay_window=close_pay_window, exit_when_done=exit_when_done)
         self._login, self._fetch = login, fetch
         self._env = (env_user, env_pass) if env_user and env_pass else None
         self._dataset_ok, self._set_dataset = dataset_ok, set_dataset
@@ -67,11 +70,14 @@ class AppServer(SelectionServer):
     def page(self) -> bytes:
         if self.menu is not None:
             return super().page()
-        return WIZARD.replace("__TOKEN__", self.token).encode("utf-8")
+        html = (WIZARD.replace("__THEME_BOOT__", THEME_BOOT).replace("__BASE_CSS__", BASE_CSS)
+                .replace("__THEME_JS__", THEME_TOGGLE_JS).replace("__THEME_BUTTON__", THEME_BUTTON)
+                .replace("__TOKEN__", self.token))
+        return html.encode("utf-8")
 
     def _progress(self, n: int, total: int) -> None:
-        self.bg["progress"] = f"{n}/{total}"
-        self.job["progress"] = f"{n}/{total}"
+        self.bg["progress"] = {"n": n, "total": total}   # صفحه آن را نوار پیشرفت نشان می‌دهد
+        self.job["progress"] = {"n": n, "total": total}
 
     def _fail(self, text: str) -> None:
         self._log(text)
@@ -209,7 +215,7 @@ class AppServer(SelectionServer):
                 for wk in ("current", "next"):  # هفته‌ای که تاریخ‌های ذخیره‌شده در آن است
                     m, _ = self._fetch_week(wk, fallback=False)
                     if dates <= {d.date for ms in m.meals for d in ms.days}:
-                        menu = m
+                        menu, week = m, wk
                         break
                 if menu is None:
                     return self._fail("تاریخ‌های انتخاب‌های ذخیره‌شده در هفته‌ی جاری و بعد پیدا نشد.")
@@ -240,7 +246,7 @@ class AppServer(SelectionServer):
                 self._log(f"ذخیره شد: {os.path.abspath(filename)}")
                 return
 
-            self.menu, self.preselect, self.notice = menu, preselect, notice
+            self.menu, self.preselect, self.notice, self.week_key = menu, preselect, notice, week
             self.stage = "select"
             self.job.update(job="idle", progress=None)
         except Exception as e:  # noqa: BLE001
@@ -250,137 +256,178 @@ class AppServer(SelectionServer):
 WIZARD = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>سامانه‌ی تغذیه</title>
+__THEME_BOOT__
 <style>
-body{font-family:Vazirmatn,Tahoma,sans-serif;max-width:560px;margin:40px auto;padding:0 14px;color:#222}
-h1{font-size:21px}.card{border:1px solid #ccc;border-radius:10px;padding:16px 18px;margin:14px 0;background:#fafafa}
-label.row{display:table;width:100%;margin:8px 0;cursor:pointer}.rc{display:table-cell;width:26px;vertical-align:top;padding-top:2px}.tc{display:table-cell;vertical-align:top}
-input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:8px;font-size:15px;margin:4px 0 10px}
-button{font-family:inherit;font-size:15px;padding:9px 22px;border:0;border-radius:6px;background:#2e7d32;color:#fff;cursor:pointer}
-button:disabled{background:#aaa}.hint{color:#666;font-size:12px}
-#bg{margin:8px 0;padding:8px 12px;border-radius:6px;background:#fff8e1;border:1px solid #ffe082;font-size:13px;display:none}#bg.done{background:#e8f5e9;border-color:#a5d6a7}
-#log{white-space:pre-wrap;line-height:1.8;font-size:14px;margin-top:10px}.err{background:#ffebee;border:1px solid #ef9a9a;padding:10px;border-radius:6px;margin:10px 0}
-.ok{background:#e8f5e9;border:1px solid #a5d6a7;padding:10px;border-radius:6px;margin:10px 0}
-.steps{color:#888;font-size:13px;display:flex;gap:14px;flex-wrap:wrap}.steps b{color:#2e7d32}
+__BASE_CSS__
+.shell{max-width:620px;margin:0 auto;padding:28px 16px 60px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px}
+h1{font-size:26px;font-weight:700;line-height:1.3}
+.steps{display:flex;gap:0;list-style:none;margin:0 0 18px;padding:0}
+.steps li{flex:1;padding:8px 0 10px;border-bottom:3px solid var(--line);color:var(--muted);font-size:13px;text-align:right}
+.steps li b{display:block;font-size:12px;font-weight:700;color:var(--muted)}
+.steps li.done{border-bottom-color:var(--leaf);color:var(--ink)}.steps li.done b{color:var(--leaf)}
+.steps li.on{border-bottom-color:var(--tile);color:var(--ink);font-weight:700}.steps li.on b{color:var(--tile)}
+#bg{display:none;margin:0 0 14px}
+#err{display:none;margin:0 0 14px}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px}
+.panel h2{font-size:18px;margin-bottom:14px}
+.field{display:block;margin:0 0 14px}
+.field>span{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
+.list{display:grid;gap:8px;margin:0 0 16px}
+.opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);cursor:pointer}
+.opt:hover{border-color:var(--muted)}
+.opt:has(input:checked){border-color:var(--tile);background:var(--tile-soft)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin:0 0 16px}
+.seg label{position:relative;cursor:pointer}
+.seg span{display:block;padding:8px 18px;color:var(--muted);font-weight:700}
+.seg input:checked+span{background:var(--tile);color:var(--tile-ink)}
+.seg input:focus-visible+span{outline:3px solid var(--tile);outline-offset:-3px}
+.label{font-size:13px;color:var(--muted);margin:0 0 6px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.working h2{margin-bottom:6px}
+.working p{color:var(--muted);font-size:14px;min-height:1.6em}
+.result{margin-top:14px}
 </style></head><body>
-<h1>سامانه‌ی تغذیه</h1>
-<div class="steps" id="steps"></div>
-<div id="bg"></div>
-<div id="err" class="err" style="display:none"></div>
+<div class="shell">
+<header class="top"><h1>سامانه‌ی تغذیه</h1>__THEME_BUTTON__</header>
+<ol class="steps" id="steps"></ol>
+<div id="bg" class="alert info" role="status"></div>
+<div id="err" class="alert err" role="alert"></div>
 <div id="view"></div>
-<div id="log"></div>
+</div>
 <script>
-var TOKEN = "__TOKEN__", T = (location.search.match(/[?&]t=([^&]+)/) || [0, TOKEN])[1], shown = null, last = null;
+var TOKEN = "__TOKEN__", T = (location.search.match(/[?&]t=([^&]+)/) || [0, TOKEN])[1], shown = null, last = null, timer = null;
+__THEME_JS__
 function h(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e; }
+function $(id){ return document.getElementById(id); }
 function api(method, path, body, cb){
   var x = new XMLHttpRequest(); x.open(method, path); x.setRequestHeader("X-Token", TOKEN); x.setRequestHeader("Content-Type","application/json");
   x.onload = function(){ var j; try{ j=JSON.parse(x.responseText); }catch(e){ j={state:"error", message:"پاسخ نامعتبر"}; } cb(j); };
   x.onerror = function(){ cb({state:"error", message:"ارتباط با برنامه قطع شد (برنامه بسته شده؟)"}); };
   x.send(body ? JSON.stringify(body) : null);
 }
-function radio(name, value, text, checked){
-  var l = h("label","row"), i = h("input"); i.type="radio"; i.name=name; i.value=value; i.checked=checked;
-  var rc = h("span","rc"), tc = h("span","tc",text); rc.appendChild(i); l.appendChild(rc); l.appendChild(tc); return l;
+function pct(p){ return p && p.total ? p.n / p.total * 100 : -1; }
+function bar(p){
+  var b = h("div", "progress" + (p < 0 ? " ind" : "")), i = h("i");
+  b.setAttribute("role","progressbar"); b.setAttribute("aria-valuemin","0"); b.setAttribute("aria-valuemax","100");
+  if(p >= 0){ i.style.width = Math.round(p) + "%"; b.setAttribute("aria-valuenow", String(Math.round(p))); }
+  b.appendChild(i); return b;
 }
+function field(label, input){ var l = h("label","field"); l.appendChild(h("span","",label)); l.appendChild(input); return l; }
 function val(name){ var e=document.getElementsByName(name); for(var i=0;i<e.length;i++) if(e[i].checked) return e[i].value; return null; }
-function showErr(t){ var e=document.getElementById("err"); e.style.display = t ? "block" : "none"; e.textContent = t || ""; }
+function showErr(t){ var e = $("err"); e.style.display = t ? "block" : "none"; e.textContent = t || ""; }
 function setSteps(n){
-  var names = ["۱) ورود", "۲) انتخاب کار", "۳) دریافت منو", "۴) انتخاب غذا"], box = document.getElementById("steps");
-  box.innerHTML = "";
-  for(var i=0;i<names.length;i++) box.appendChild(h(i+1===n ? "b" : "span", "", names[i]));
+  var names = ["ورود", "انتخاب کار", "دریافت منو", "انتخاب غذا"], box = $("steps"); box.innerHTML = "";
+  for(var i=0;i<names.length;i++){
+    var li = h("li", i+1 < n ? "done" : (i+1 === n ? "on" : "")); li.appendChild(h("b","", String(i+1))); li.appendChild(document.createTextNode(names[i])); box.appendChild(li);
+  }
+}
+function radioRow(name, value, text, checked){
+  var l = h("label","opt"), i = h("input"); i.type = "radio"; i.name = name; i.value = value; i.checked = checked;
+  l.appendChild(i); l.appendChild(h("span","",text)); return l;
+}
+function segItem(name, value, text, checked){
+  var l = h("label"), i = h("input","vh"); i.type = "radio"; i.name = name; i.value = value; i.checked = checked;
+  l.appendChild(i); l.appendChild(h("span","",text)); return l;
 }
 
 function renderLogin(st){
   setSteps(1);
-  var v = document.getElementById("view"); v.innerHTML = "";
-  var c = h("div","card"); c.appendChild(h("div","","ورود به سامانه"));
+  var v = $("view"); v.innerHTML = "";
+  var c = h("div","panel"); c.appendChild(h("h2","","ورود"));
   var u, p, d;
-  if(st.env_user){
-    c.appendChild(h("p","hint","اطلاعات ورود در محیط تنظیم شده است (کاربر: " + st.env_user + ")."));
-  } else {
-    c.appendChild(h("div","hint","نام کاربری")); u = h("input"); u.type="text"; c.appendChild(u);
-    c.appendChild(h("div","hint","رمز عبور (فقط به همین برنامه‌ی محلی می‌رسد)")); p = h("input"); p.type="password"; c.appendChild(p);
+  if(st.env_user){ c.appendChild(h("p","label","کاربر: " + st.env_user)); }
+  else {
+    u = h("input"); u.type = "text"; u.autocomplete = "username"; c.appendChild(field("نام کاربری", u));
+    p = h("input"); p.type = "password"; p.autocomplete = "current-password"; c.appendChild(field("رمز عبور", p));
   }
-  if(st.need_dataset){
-    c.appendChild(h("div","hint","مسیر پوشه‌ی دیتاست کپچا")); d = h("input"); d.type="text"; c.appendChild(d);
-  }
-  var b = h("button","", st.env_user ? "ورود دوباره" : "ورود"); c.appendChild(b); v.appendChild(c);
+  if(st.need_dataset){ d = h("input"); d.type = "text"; c.appendChild(field("پوشه‌ی دیتاست کپچا", d)); }
+  var b = h("button","btn primary", st.env_user ? "ورود دوباره" : "ورود"); b.type = "button"; c.appendChild(b); v.appendChild(c);
   function go(){
     showErr(""); b.disabled = true;
     api("POST","/api/login", {useenv: !!st.env_user, username: u?u.value:"", password: p?p.value:"", dataset: d?d.value:""}, function(j){
-      if(j.state==="working"){ shown = null; tick(); }  // بلافاصله مرحله‌ی بعد؛ ورود در پس‌زمینه ادامه دارد
-      else { showErr(j.message); b.disabled=false; }
+      if(j.state === "working"){ shown = null; tick(); }   // ورود در پس‌زمینه ادامه دارد؛ مرحله‌ی بعد همین حالا باز می‌شود
+      else { showErr(j.message); b.disabled = false; }
     });
   }
   b.onclick = go;
-  if(p) p.onkeydown = function(e){ if(e.keyCode===13) go(); };
+  if(p) p.onkeydown = function(e){ if(e.keyCode === 13) go(); };
+  if(u) u.focus();
 }
 
 function renderHome(st){
   setSteps(2);
-  var v = document.getElementById("view"); v.innerHTML = "";
+  var v = $("view"); v.innerHTML = "";
   var dm = last ? last.mode : st.defaults.mode, dw = last ? last.week : st.defaults.week, df = last ? last.filename : "menu.html";
-  var c = h("div","card"); c.appendChild(h("div","","چه کاری انجام شود؟"));
-  c.appendChild(radio("mode","reserve","مشاهده‌ی منو، انتخاب غذا و ثبت رزرو", dm==="reserve"));
-  c.appendChild(radio("mode","file","فقط دریافت منو و ساخت فایل", dm==="file"));
-  if(st.has_pending) c.appendChild(radio("mode","pending","ادامه‌ی انتخاب‌های ذخیره‌شده (بعد از شارژ موجودی)", dm==="pending"));
-  var weekBox = h("div"); weekBox.appendChild(h("div","","کدام هفته؟"));
-  weekBox.appendChild(radio("week","current","هفته جاری", dw==="current"));
-  weekBox.appendChild(radio("week","next","هفته بعد (برای رزرو)", dw==="next"));
-  c.appendChild(weekBox);
-  var fileBox = h("div"); fileBox.appendChild(h("div","hint","نام فایل (پسوند: .html یا .json یا .txt)"));
-  var fn = h("input"); fn.type="text"; fn.value=df; fileBox.appendChild(fn); c.appendChild(fileBox);
-  function sync(){ var m = val("mode"); weekBox.style.display = m==="pending" ? "none" : "block"; fileBox.style.display = m==="file" ? "block" : "none"; }
+  var c = h("div","panel"); c.appendChild(h("h2","","چه کاری انجام شود؟"));
+  var list = h("div","list");
+  list.appendChild(radioRow("mode","reserve","مشاهده، انتخاب غذا و ثبت رزرو", dm === "reserve"));
+  list.appendChild(radioRow("mode","file","فقط ساخت فایل منو", dm === "file"));
+  if(st.has_pending) list.appendChild(radioRow("mode","pending","ادامه‌ی انتخاب‌های ذخیره‌شده", dm === "pending"));
+  c.appendChild(list);
+  var weekBox = h("div"); weekBox.appendChild(h("div","label","هفته"));
+  var seg = h("div","seg"); seg.appendChild(segItem("week","current","هفته جاری", dw === "current")); seg.appendChild(segItem("week","next","هفته بعد", dw === "next"));
+  weekBox.appendChild(seg); c.appendChild(weekBox);
+  var fn = h("input"); fn.type = "text"; fn.value = df; fn.placeholder = "menu.html";
+  var fileBox = field("نام فایل (html / json / txt)", fn); c.appendChild(fileBox);
+  function sync(){ var m = val("mode"); weekBox.style.display = m === "pending" ? "none" : "block"; fileBox.style.display = m === "file" ? "block" : "none"; }
   var rs = document.getElementsByName("mode"); for(var i=0;i<rs.length;i++) rs[i].onchange = sync; sync();
-  var b = h("button","","ادامه"); c.appendChild(b); v.appendChild(c);
+  var b = h("button","btn primary","ادامه"); b.type = "button"; c.appendChild(b); v.appendChild(c);
   if(st.file){
-    var ok = h("div","ok"); ok.appendChild(document.createTextNode("ذخیره شد: " + st.file.path + "  "));
-    var a = h("a","","باز کردن در مرورگر"); a.href = "/file?t=" + encodeURIComponent(T); a.target = "_blank"; ok.appendChild(a);
-    if(st.file.notice) ok.appendChild(h("div","hint",st.file.notice));
+    var ok = h("div","alert ok result"); ok.appendChild(document.createTextNode("ذخیره شد: " + st.file.path + "  "));
+    var a = h("a","","باز کردن"); a.href = "/file?t=" + encodeURIComponent(T); a.target = "_blank"; ok.appendChild(a);
+    if(st.file.notice) ok.appendChild(h("div","",st.file.notice));
     v.appendChild(ok);
   }
   b.onclick = function(){
     showErr(""); b.disabled = true;
     last = {mode: val("mode"), week: val("week"), filename: fn.value};
     api("POST","/api/start", last, function(j){
-      if(j.state==="working"){ shown = null; tick(); } else { showErr(j.message); b.disabled=false; }
+      if(j.state === "working"){ shown = null; tick(); } else { showErr(j.message); b.disabled = false; }
     });
   };
 }
 
+function renderBusy(st){
+  setSteps(3);
+  var v = $("view"); v.innerHTML = "";
+  var c = h("div","panel working"); c.id = "busy"; c.appendChild(h("h2","","در حال دریافت منو"));
+  c.appendChild(h("p","")); c.appendChild(bar(-1)); v.appendChild(c);
+}
+
 function banner(st){
-  var b = document.getElementById("bg"), g = st.bg || {}, t = "", done = false;
-  if(st.stage==="home" || st.job==="working"){
-    if(g.login==="working") t = "در حال ورود به سامانه در پس‌زمینه ... می‌توانی همین حالا انتخاب‌هایت را بزنی.";
-    else if(g.login==="done"){
-      done = true; t = "ورود موفق ✓";
-      if(g.prefetch==="working") t += g.fallback
-          ? " — هفته بعد هنوز غذایی ندارد؛ در حال دریافت منوی هفته جاری" + (g.progress ? " (" + g.progress + ")" : "") + " ..."
-          : " — در حال دریافت منوی " + (g.week==="next" ? "هفته بعد" : "هفته جاری") + " در پس‌زمینه" + (g.progress ? " (" + g.progress + ")" : "") + " ...";
-      else if(g.prefetch==="done") t += g.fallback ? " — هفته بعد هنوز غذایی ندارد؛ منوی هفته جاری آماده است ✓" : " — منو آماده است ✓";
+  var b = $("bg"), g = st.bg || {}, t = "", p = null, ok = false;
+  if(st.stage === "home" || st.job === "working"){
+    if(g.login === "working"){ t = "در حال ورود در پس‌زمینه ..."; p = -1; }
+    else if(g.login === "done"){
+      ok = true; t = "ورود شد";
+      var w = g.week === "next" ? "هفته بعد" : "هفته جاری";
+      if(g.prefetch === "working"){ t += g.fallback ? " · هفته بعد خالی است؛ در حال دریافت هفته جاری" : " · در حال دریافت منوی " + w; p = pct(g.progress); ok = false; }
+      else if(g.prefetch === "done") t += g.fallback ? " · هفته بعد خالی است؛ منوی هفته جاری آماده است" : " · منوی " + w + " آماده است";
     }
   }
-  b.style.display = t ? "block" : "none"; b.className = done ? "done" : ""; b.textContent = t;
+  b.style.display = t ? "block" : "none"; b.className = "alert " + (ok ? "ok" : "info"); b.innerHTML = "";
+  if(t){ b.appendChild(h("div","",t)); if(p !== null && st.job !== "working") b.appendChild(bar(p)); }  // هنگام «دریافت منو» نوار فقط در کارت اصلی می‌آید
 }
 
 function render(st){
-  showErr(st.error || (st.stage==="login" ? (st.bg||{}).login_error : null));
+  showErr(st.error || (st.stage === "login" ? (st.bg || {}).login_error : null));
   banner(st);
-  document.getElementById("log").textContent = st.job==="working" ? ((st.log||[]).join("\n") + (st.progress ? ("\n" + st.progress) : "")) : "";
-  if(st.stage==="select"){ location.reload(); return false; }
-  var want = st.job==="working" ? "busy" : st.stage;
-  if(want!==shown){  // فرم فقط وقتی مرحله عوض شد دوباره ساخته می‌شود (انتخاب‌های کاربر پاک نشود)
+  if(st.stage === "select"){ location.reload(); return false; }
+  var want = st.job === "working" ? "busy" : st.stage;
+  if(want !== shown){   // فرم فقط وقتی مرحله عوض شد ساخته می‌شود (انتخاب‌های کاربر پاک نشود)
     shown = want;
-    if(want==="busy"){ document.getElementById("view").innerHTML = ""; setSteps(3); }
-    else if(want==="login") renderLogin(st); else renderHome(st);
+    if(want === "busy") renderBusy(st); else if(want === "login") renderLogin(st); else renderHome(st);
+  }
+  if(want === "busy"){
+    var c = $("busy");
+    if(c){ c.getElementsByTagName("p")[0].textContent = (st.log || []).slice(-1)[0] || ""; var old = c.getElementsByClassName("progress")[0]; c.replaceChild(bar(pct(st.progress)), old); }
   }
   return true;
 }
-
-var timer = null;
-function tick(){
-  api("GET","/api/status",null,function(st){ if(!render(st) && timer){ clearInterval(timer); timer = null; } });
-}
+function tick(){ api("GET","/api/status",null,function(st){ if(!render(st) && timer){ clearInterval(timer); timer = null; } }); }
 timer = setInterval(tick, 1000); tick();
 </script></body></html>
 """

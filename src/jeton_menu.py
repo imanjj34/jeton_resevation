@@ -64,8 +64,10 @@ EPAY_URL = BASE_URL + "ePay/ePay_Payment.aspx"
 # ----------------------------------------------------------------- تنظیمات پیش‌فرض
 DEFAULT_UI = os.environ.get("JETON_UI", "terminal")  # "terminal" یا "web" (با --ui هم عوض می‌شود)
 DEFAULT_MODE = "reserve"   # reserve = مشاهده و رزرو | file = فقط منو و فایل | pending = انتخاب‌های ذخیره‌شده
-DEFAULT_WEEK = "current"      # current = هفته جاری | next = هفته بعد
+DEFAULT_WEEK = "next"      # current = هفته جاری | next = هفته بعد
 HEADLESS_LOGIN = True      # مرورگر لاگین/کپچا مخفی باشد. پنجره‌ی پرداخت همیشه دیده می‌شود (کارت را خودت وارد می‌کنی)
+CLOSE_PAYMENT_WINDOW_WHEN_DONE = True  # بعد از نتیجه‌ی پرداخت، پنجره‌ی بانک خودکار بسته شود؟
+EXIT_AFTER_SUCCESS = False              # بعد از ثبت موفق، خودِ برنامه (سرور محلی) بسته شود؟ False = باز می‌ماند تا Ctrl+C
 
 DATASET_PATH = os.environ.get("JETON_CAPTCHA_DATASET", r"C:\Users\iman\Documents\project\image vision\dataset")
 EAGER_LOAD = True          # صفحه‌ی لاگین را بدون انتظار برای همه‌ی منابع باز کن (سریع‌تر). اگر مشکل داشت False کن
@@ -374,7 +376,9 @@ def ask_week() -> str:
 
 
 def show_progress(n: int, total: int) -> None:
-    print(f"\r  {n}/{total}", end="", flush=True)
+    width = 30
+    filled = int(width * n / total) if total else width
+    print(f"\r  [{'█' * filled}{'░' * (width - filled)}] {int(100 * n / total) if total else 100}٪", end="", flush=True)
 
 
 def report(results: list[dict]) -> None:
@@ -383,6 +387,8 @@ def report(results: list[dict]) -> None:
         print(f"{'✓' if r['ok'] else '✗'} {r['meal']}" + (f" - پیام سایت: {r['message']}" if r.get("message") else ""))
         for pr in r["problems"]:
             print(f"    ! {pr}")
+        for w in r.get("warnings", []):
+            print(f"    ؟ {w}")
         if r.get("credit") is not None:
             print(f"    موجودی پس از ذخیره: {r['credit']:,} ریال")
     if all(r["ok"] for r in results):
@@ -436,7 +442,9 @@ def mode_reserve(session, relogin, username: str, password: str, week: str, menu
         return
     # انتخاب در صفحه‌ی وب انجام می‌شود و بعد از «ثبت نهایی» روی سایت اعمال می‌شود
     SelectionServer(session, menu, relogin,
-                    pay_opener=lambda sess, amount: open_payment(sess, amount, username, password)).run()
+                    pay_opener=lambda sess, amount: open_payment(sess, amount, username, password),
+                    refetch=lambda sess, wk, on_progress: fetch_menu(sess, wk, all_selves=True, on_progress=on_progress),
+                    week_key=week, close_pay_window=CLOSE_PAYMENT_WINDOW_WHEN_DONE, exit_when_done=EXIT_AFTER_SUCCESS).run()
 
 
 def mode_pending(session, relogin) -> None:
@@ -513,6 +521,7 @@ def web_main() -> None:
         env_user=os.environ.get("JETON_USER"), env_pass=os.environ.get("JETON_PASS"),
         dataset_ok=lambda: os.path.isdir(DATASET_PATH), set_dataset=set_dataset,
         default_mode=DEFAULT_MODE, default_week=DEFAULT_WEEK,
+        close_pay_window=CLOSE_PAYMENT_WINDOW_WHEN_DONE, exit_when_done=EXIT_AFTER_SUCCESS,
     ).run()
 
 

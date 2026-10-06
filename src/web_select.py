@@ -20,7 +20,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from food_menu import WeekMenu
+from food_menu import WeekMenu, fallback_notice
+from ui import BASE_CSS, GRID_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
 from reserve import (Choice, _is_noop, clear_pending, find_day, find_meal, open_week_state, price_delta,
                      read_credit, save_pending, submit, summary_lines)
 
@@ -100,13 +101,20 @@ def selections_to_choices(menu: WeekMenu, selections: list[dict]) -> list[Choice
 
 # ------------------------------------------------------------------ سرور
 class SelectionServer:
-    def __init__(self, session, menu: WeekMenu, relogin, pay_opener=None):
+    def __init__(self, session, menu: WeekMenu, relogin, pay_opener=None, refetch=None, week_key=None,
+                 close_pay_window=False, exit_when_done=False):
         """
         pay_opener(session, amount) -> شیئی با close() و wait_for_result(stop) که پنجره‌ی پرداخت اینترنتی را
         باز می‌کند و بعد از برگشت از بانک نتیجه را برمی‌گرداند (اختیاری؛ بدون آن بخش پرداخت پنهان است).
+        refetch(session, week, on_progress) -> WeekMenu و week_key ("current"/"next"): برای دکمه‌ی «دریافت مجدد».
+        close_pay_window: بعد از نتیجه‌ی پرداخت، پنجره‌ی پرداخت خودکار بسته شود؟ (پیش‌فرض: نه)
+        exit_when_done:  بعد از ثبت موفق، خودِ برنامه (سرور محلی) بسته شود؟ (پیش‌فرض: نه)
         """
         self.session, self.menu, self._relogin = session, menu, relogin
         self.pay_opener = pay_opener
+        self._refetch, self.week_key = refetch, week_key
+        self.close_pay_window, self.exit_when_done = close_pay_window, exit_when_done
+        self._kept_browsers: list = []  # پنجره‌های پرداختی که عمداً باز نگه داشته شده‌اند
         self.preselect: dict = {}
         self.notice: str | None = None  # مثلاً «هفته بعد هنوز غذایی ندارد؛ هفته جاری نمایش داده شد»
         self.pay_browser = None
@@ -116,7 +124,8 @@ class SelectionServer:
         self.token = secrets.token_urlsafe(16)
         self.lock = threading.Lock()
         self.stop = threading.Event()
-        self.job = {"job": "idle", "log": [], "results": None, "ok": None, "paid": None, "pay": None}
+        self.job = {"job": "idle", "log": [], "results": None, "ok": None, "paid": None, "pay": None,
+                    "progress": None, "data_version": 0, "error": None}
         self.httpd: ThreadingHTTPServer | None = None
 
     # -- کمکی‌ها
@@ -136,11 +145,14 @@ class SelectionServer:
             return fn()
 
     def _busy(self) -> bool:
-        return self.job["job"] in ("submitting", "paying") or self.pay_opening or self.pay_browser is not None
+        return self.job["job"] in ("submitting", "paying", "reloading") or self.pay_opening or self.pay_browser is not None
 
     def _finish_soon(self) -> None:
-        if self.httpd:
+        if self.exit_when_done and self.httpd:
             threading.Timer(4.0, self.httpd.shutdown).start()
+
+    def _progress(self, n: int, total: int) -> None:
+        self.job["progress"] = {"n": n, "total": total}
 
     def _close_pay(self) -> None:
         if self.pay_browser is not None:
@@ -148,6 +160,22 @@ class SelectionServer:
                 self.pay_browser.close()
             finally:
                 self.pay_browser = None
+
+    def _release_pay(self) -> None:
+        """بعد از نتیجه‌ی پرداخت: پنجره را می‌بندد یا (پیش‌فرض) باز می‌گذارد و فقط از کنترل برنامه جدا می‌کند."""
+        if self.close_pay_window:
+            self._close_pay()
+        elif self.pay_browser is not None:
+            self._kept_browsers.append(self.pay_browser)
+            self.pay_browser = None
+
+    def _close_kept(self) -> None:
+        for b in self._kept_browsers:
+            try:
+                b.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._kept_browsers.clear()
 
     # -- ثبت رزرو
     def api_submit(self, body: dict) -> dict:
@@ -250,7 +278,7 @@ class SelectionServer:
         if res is None:  # لغو شد (api_cancel خودش پنجره را بسته)
             self.job.update(job="idle")
             return
-        self._close_pay()
+        self._release_pay()
         if res.get("closed"):
             self._log("پنجره‌ی پرداخت قبل از برگشت از بانک بسته شد. اگر پرداخت کرده‌ای «بروزرسانی موجودی» را بزن.")
             self.job.update(job="idle")
@@ -287,6 +315,41 @@ class SelectionServer:
             if choices:
                 self._log(f"اعتبار هنوز برای انتخاب‌ها کافی نیست (لازم: {delta:,} ریال).")
 
+    # -- دریافت مجدد منو از سایت
+    def _reload_menu(self):
+        wk = self.week_key or "current"
+        menu = self._refetch(self.session, wk, self._progress)
+        if wk == "next" and not menu.has_food:  # هفته بعد هنوز خالی است: همان جایگزینیِ هفته جاری
+            current = self._refetch(self.session, "current", self._progress)
+            if current.has_food:
+                return current, fallback_notice(menu, current)
+        return menu, None
+
+    def api_reload(self, body: dict | None = None) -> dict:
+        if self._refetch is None:
+            return {"state": "error", "message": "دریافت مجدد در این اجرا فعال نیست."}
+        if self._busy():
+            return {"state": "error", "message": "یک عملیات در حال انجام است؛ صبر کن تمام شود."}
+        self.job.update(job="reloading", log=[], error=None, progress=None)
+        threading.Thread(target=self._reload_job, daemon=True).start()
+        return {"state": "reloading"}
+
+    def _reload_job(self) -> None:
+        try:
+            self._log("در حال دریافت دوباره‌ی منو از سایت ...")
+            menu, notice = self._with_relogin(self._reload_menu)
+            self.menu, self.notice = menu, notice
+            self.job["data_version"] += 1
+            self.job.update(job="idle", progress=None)
+        except Exception as e:  # noqa: BLE001
+            self.job.update(job="idle", progress=None, error=f"دریافت مجدد ناموفق: {type(e).__name__}: {e}")
+
+    def data(self) -> dict:
+        d = build_data(self.menu, self.preselect)
+        d.update(canPay=self.pay_opener is not None, notice=self.notice, version=self.job["data_version"],
+                 exitWhenDone=self.exit_when_done, canReload=self._refetch is not None)
+        return d
+
     def api_cancel(self) -> dict:
         self.stop.set()
         self._close_pay()
@@ -296,11 +359,12 @@ class SelectionServer:
 
     # -- HTTP
     def page(self) -> bytes:
-        d = build_data(self.menu, self.preselect)
-        d["canPay"] = self.pay_opener is not None
-        d["notice"] = self.notice
-        data = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
-        return PAGE.replace("__DATA__", data).replace("__TOKEN__", self.token).encode("utf-8")
+        data = json.dumps(self.data(), ensure_ascii=False).replace("</", "<\\/")
+        data = data.replace("\u2028", "\\u2028")
+        html = (PAGE.replace("__THEME_BOOT__", THEME_BOOT).replace("__BASE_CSS__", BASE_CSS).replace("__GRID_CSS__", GRID_CSS)
+                .replace("__THEME_JS__", THEME_TOGGLE_JS).replace("__THEME_BUTTON__", THEME_BUTTON)
+                .replace("__TOKEN__", self.token).replace("__DATA__", data))
+        return html.encode("utf-8")
 
     def status(self) -> dict:
         return self.job
@@ -311,7 +375,8 @@ class SelectionServer:
 
     def routes(self) -> dict:
         return {"/api/submit": self.api_submit, "/api/pay": self.api_pay, "/api/topup": self.api_topup,
-                "/api/credit": lambda body: self.api_credit(), "/api/cancel": lambda body: self.api_cancel()}
+                "/api/credit": lambda body: self.api_credit(), "/api/cancel": lambda body: self.api_cancel(),
+                "/api/reload": self.api_reload}
 
     def _handler(self):
         srv = self
@@ -348,6 +413,8 @@ class SelectionServer:
                     return self._send(200, srv.page(), "text/html; charset=utf-8")
                 if u.path == "/api/status" and self._ok_token():
                     return self._json(srv.status())
+                if u.path == "/api/data" and self._ok_token() and srv.menu is not None:
+                    return self._json(srv.data())
                 extra = srv.extra_get(u.path) if self._ok_token_query(u) else None
                 if extra:
                     return self._send(200, extra[0], extra[1])
@@ -385,6 +452,7 @@ class SelectionServer:
         finally:
             self.stop.set()
             self._close_pay()
+            self._close_kept()
             self.httpd.server_close()
 
 
@@ -392,140 +460,191 @@ class SelectionServer:
 PAGE = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>انتخاب غذا</title>
+__THEME_BOOT__
 <style>
-body{font-family:Vazirmatn,Tahoma,sans-serif;max-width:960px;margin:0 auto;padding:12px 12px 230px;color:#222;background:#fff}
-h1{font-size:20px;margin:8px 0}
-#tabs{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 0;position:sticky;top:0;background:#fff;padding:6px 0;z-index:5;border-bottom:2px solid #2e7d32}
-.tabbtn{background:#eceff1;color:#333;border:1px solid #cfd8dc;padding:7px 18px;border-radius:8px 8px 0 0;font-size:15px}
-.tabbtn.on{background:#2e7d32;color:#fff;border-color:#2e7d32}.tabbtn .n{background:#ffb300;color:#222;border-radius:9px;padding:0 7px;font-size:12px;margin-right:6px}
-.panel{margin-top:10px}
-table{width:100%;border-collapse:collapse}td{border:1px solid #ccc;padding:6px 8px;vertical-align:top;text-align:right}
-td.day{white-space:nowrap;font-weight:bold;width:1%;background:#f6f6f6}td.day small{font-weight:normal;color:#666}
-.badge{display:inline-block;background:#e8f5e9;color:#1b5e20;border-radius:4px;padding:0 6px;font-size:12px;margin-top:4px}
-tr.off td{color:#999;background:#fafafa}tr.locked td.opts{background:#fafafa;color:#555}
-.selfname{font-weight:bold;margin:8px 0 2px;color:#444}.selfname:first-child{margin-top:0}
-label.opt{display:table;width:100%;box-sizing:border-box;padding:3px 4px;border-radius:5px;cursor:pointer}.rc{display:table-cell;width:26px;vertical-align:top;padding-top:2px}.tc{display:table-cell;vertical-align:top}label.opt:hover{background:#f3f3f3}
-label.opt.chosen{background:#fff3cd}label.opt input{margin:0}
-.price{color:#777;font-size:12px}.cur{font-weight:bold}.tick{color:#2e7d32;font-weight:bold}
-.none{color:#a33}
-#bar{position:fixed;right:0;left:0;bottom:0;background:#fff;border-top:2px solid #2e7d32;padding:10px 14px;box-shadow:0 -2px 8px rgba(0,0,0,.12)}
-#bar .in{max-width:960px;margin:0 auto}
-#nums span{display:inline-block;margin-left:18px}#nums b{font-size:16px}
-.bad{color:#c62828}.good{color:#1b5e20}
-#chg{margin:6px 0;padding:0 18px;font-size:13px;max-height:64px;overflow:auto;color:#444}
-button{font-family:inherit;font-size:15px;padding:8px 18px;border:0;border-radius:6px;background:#2e7d32;color:#fff;cursor:pointer}
-button:disabled{background:#aaa;cursor:not-allowed}button.sec{background:#757575}
-#topup{margin:8px 0;padding:6px 10px;border:1px solid #bbdefb;border-radius:6px;background:#f5faff}#topup summary{cursor:pointer;font-weight:bold;color:#1565c0}.topbox{margin-top:8px}.topbox .hint{color:#666;font-size:12px;margin-top:4px}
-#payrow{display:none;margin:6px 0;font-size:14px}#payrow .hint{color:#666;font-size:12px;margin-top:2px}button.pay{background:#1565c0;padding:5px 14px;font-size:14px}
-button.small{font-size:12px;padding:3px 10px}#numsrow{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
-#out{margin:10px 0;padding:10px;border-radius:6px;display:none;white-space:pre-wrap;line-height:1.8}
-#out.ok{background:#e8f5e9;border:1px solid #a5d6a7}#out.err{background:#ffebee;border:1px solid #ef9a9a}#out.info{background:#fff8e1;border:1px solid #ffe082}
+__BASE_CSS__
+__GRID_CSS__
+body{padding-bottom:170px}
+#out{display:none;margin:4px 0 12px}
+label.opt{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:6px;cursor:pointer}
+label.opt:hover{background:var(--sunken)}
+label.opt.cur .tx{font-weight:700}
+label.opt.chosen{background:var(--saffron-soft);box-shadow:inset 0 0 0 1.5px var(--saffron)}
+td.cancel{position:relative;padding:0;width:104px;min-width:104px}
+.cbtn{position:absolute;inset:0;display:block;cursor:pointer}
+.cbtn span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:4px;text-align:center;
+  color:var(--muted);font-size:13px;font-weight:700}
+.cbtn:hover span{background:var(--sunken)}
+tr.res .cbtn input:checked+span{background:var(--brick-soft);color:var(--brick)}
+.cbtn input:focus-visible+span{outline:3px solid var(--tile);outline-offset:-3px}
+
+#dock{position:fixed;inset-inline:0;bottom:0;z-index:10;background:var(--surface);border-top:1px solid var(--line)}
+.dockin{position:relative;display:flex;align-items:center;flex-wrap:wrap;gap:12px 28px;padding:12px clamp(12px,2.2vw,32px)}
+.ledger{flex:1 1 360px;min-width:280px}
+.meter{display:flex;height:14px;border-radius:99px;background:var(--sunken);overflow:hidden}
+.meter i{display:block;height:100%;transition:width .25s ease}
+#mRemain{background:var(--tile)}#mSpend{background:var(--saffron)}
+.meter.short #mSpend{background:var(--brick)}
+#nums{display:flex;flex-wrap:wrap;gap:4px 28px;margin:8px 0 0;padding:0}
+#nums div{display:flex;flex-direction:column;line-height:1.35}
+#nums dt{font-size:12px;color:var(--muted)}
+#nums dd{margin:0;font-weight:700;font-size:18px;direction:ltr;unicode-bidi:isolate;text-align:right}
+.bad{color:var(--brick)}.good{color:var(--leaf)}
+.pay{display:flex;align-items:center;gap:8px}
+.pay[hidden]{display:none}
+#paytoggle{display:none}
+.pay label{color:var(--muted);font-size:13px}
+.pay input{width:124px;text-align:left;direction:ltr}
+.pay.need input{border-color:var(--brick)}
+.pay .unit{color:var(--muted);font-size:13px}
+.acts{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chip{background:var(--saffron-soft);color:var(--ink);border:1px solid var(--saffron);border-radius:99px;padding:4px 14px;
+  font-weight:700;cursor:pointer}
+.chip[hidden]{display:none}
+#chg{position:absolute;bottom:100%;inset-inline-end:clamp(12px,2.2vw,32px);margin:0;padding:10px 30px 10px 16px;min-width:320px;
+  max-height:260px;overflow:auto;background:var(--surface);border:1px solid var(--line);border-bottom:0;border-radius:12px 12px 0 0;
+  font-size:14px}
+#chg[hidden]{display:none}
+@media (max-width:640px){.pay input{width:100px}.pay:not(.open):not(.need){display:none}#paytoggle{display:inline-block}
+  .dockin{gap:8px 16px;padding-top:10px;padding-bottom:10px}#nums dd{font-size:16px}.acts{width:100%}.acts .btn{padding:6px 12px;font-size:13px}.acts #go{order:-1;flex:1 1 150px;font-size:15px;padding:9px 14px}}
 </style></head><body>
-<h1>انتخاب غذا - هفته <bdi id="week"></bdi></h1>
-<p style="color:#666;font-size:13px">برای هر وعده در هر روز فقط یک گزینه می‌توانی انتخاب کنی. غذای پررنگ با ✓ سبز، رزرو فعلی توست. هیچ چیز تا زدن «ثبت نهایی» روی سایت اعمال نمی‌شود.</p>
-<details id="topup" style="display:none"><summary>افزایش اعتبار / آزمایش پرداخت اینترنتی (مستقل از انتخاب غذا)</summary>
- <div class="topbox">مبلغ <input id="topamt" type="text" size="12" value="10,000"> ریال
- <button id="topgo" class="pay">رفتن به درگاه پرداخت</button>
- <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار اینترنتی» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از برگشت از بانک، نتیجه‌ی تراکنش و اعتبار جدید همین‌جا اعلام می‌شود (رزروی انجام نمی‌شود).</div></div>
-</details>
-<div id="out"></div>
-<div id="tabs"></div>
-<div id="meals"></div>
-<div id="bar"><div class="in">
- <div id="numsrow"><span id="nums"></span> <button id="refreshcredit" class="sec small" title="خواندن دوباره‌ی موجودی از سایت">بروزرسانی موجودی</button></div>
- <ul id="chg"></ul>
- <div id="payrow">پرداخت اینترنتی: مبلغ <input id="payamt" type="text" size="12"> ریال
-  <button id="pay" class="pay">رفتن به درگاه پرداخت</button>
-  <div class="hint">یک پنجره‌ی مرورگر جدا باز می‌شود و مبلغ در صفحه‌ی «افزایش اعتبار» پر می‌شود؛ کارت و رمز را فقط خودت در صفحه‌ی بانک وارد می‌کنی. بعد از برگشت از بانک و تأیید پرداخت، اعتبار یک بار بررسی می‌شود و در صورت کافی بودن، همین غذاها خودکار رزرو می‌شوند. اگر پرداخت را جای دیگری انجام دادی، «بروزرسانی موجودی» و بعد «ثبت نهایی» را بزن.</div></div>
- <button id="go" disabled>ثبت نهایی در سایت</button>
- <button id="stopwait" class="sec" style="display:none">لغو پرداخت</button>
-</div></div>
+<div class="wrap">
+<header class="top">
+  <div><span class="eyebrow">برنامه غذایی</span><h1><bdi id="week"></bdi></h1></div>
+  <div class="tools">
+    <button id="reload" class="btn ghost" type="button" style="display:none">دریافت مجدد</button>
+    __THEME_BUTTON__
+  </div>
+</header>
+<div id="out" role="status" aria-live="polite"></div>
+<nav id="tabs" role="tablist" aria-label="وعده‌ها"></nav>
+<main id="meals"></main>
+</div>
+<footer id="dock"><div class="dockin">
+  <div class="ledger">
+    <div id="meter" class="meter" aria-hidden="true"><i id="mRemain"></i><i id="mSpend"></i></div>
+    <dl id="nums"></dl>
+  </div>
+  <div id="payrow" class="pay" hidden>
+    <label for="payamt">پرداخت</label>
+    <input id="payamt" inputmode="numeric" autocomplete="off" value="10,000" aria-label="مبلغ پرداخت (ریال)">
+    <span class="unit">ریال</span>
+    <button id="pay" class="btn secondary" type="button">پرداخت اینترنتی</button>
+    <button id="stopwait" class="btn ghost" type="button" style="display:none">لغو پرداخت</button>
+  </div>
+  <div class="acts">
+    <button id="paytoggle" class="btn ghost" type="button" aria-expanded="false" hidden>پرداخت</button>
+    <button id="refreshcredit" class="btn ghost" type="button">بروزرسانی موجودی</button>
+    <button id="changes" class="chip" type="button" aria-expanded="false" hidden></button>
+    <button id="go" class="btn primary" type="button" disabled>ثبت نهایی</button>
+  </div>
+  <ul id="chg" hidden></ul>
+</div></footer>
 <script>
 var DATA = __DATA__;
 var TOKEN = "__TOKEN__";
-var rows = [];       // {meal, day, name, initial, prices:{value:price}, labels:{value:text}}
-var busy = false, poll = null, preApplied = 0;
+__THEME_JS__
+var rows = [], busy = false, poll = null, preApplied = 0, activeTab = -1, lastShort = 0;
+var dataVersion = DATA.version || 0, autoReload = false, manualReload = false;
 
 function h(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e; }
-function fmt(n){ return String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
-function sgn(n){ return (n<0?"-":(n>0?"+":"")) + fmt(n); }
+function $(id){ return document.getElementById(id); }
+function fmt(n){ return String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+function sgn(n){ return (n<0?"\u2212":(n>0?"+":"")) + fmt(n); }
+function parseAmt(t){ return parseInt(String(t).replace(/[^0-9]/g,""),10) || 0; }
+
+function selvesOf(meal){      // ستون‌ها: هر سلفی که در این وعده در هر روزی غذا دارد (به ترتیب دیده‌شدن)
+  var seen = {}, list = [];
+  meal.days.forEach(function(d){ d.selves.forEach(function(s){ if(!seen[s.id]){ seen[s.id]=1; list.push({id:s.id, name:s.name}); } }); });
+  return list;
+}
+
+function buildRow(meal, day, selves, tb){
+  var tr = h("tr", day.reserved ? "res" : ""), dayTd = h("td","day");
+  dayTd.appendChild(h("strong","",day.weekday)); dayTd.appendChild(h("span","dt",day.date));
+  if(day.reserved) dayTd.appendChild(h("span","badge","رزرو شده"));
+  tr.appendChild(dayTd); tb.appendChild(tr);
+  var span = selves.length + 1, td;
+  if(!day.active){ tr.className = "off"; td = h("td","msg","—"); td.colSpan = span; tr.appendChild(td); return; }
+  if(day.locked){ td = h("td","msg", day.reserved ? ("قفل‌شده · " + (day.curFood||"")) : "قفل‌شده"); td.colSpan = span; tr.appendChild(td); return; }
+
+  var name = meal.key + "|" + day.date, info = {meal: meal, day: day, name: name, initial: day.reserved ? "cur" : "none", prices: {}, labels: {}, tr: tr};
+  var hasCur = false;
+  day.selves.forEach(function(s){ s.foods.forEach(function(f){ if(f.cur) hasCur = true; }); });
+  function radio(value, checked){ var i = h("input"); i.type="radio"; i.name=name; i.value=value; i.checked=checked; i.onchange=refresh; return i; }
+
+  if(day.reserved && !hasCur){   // رزرو فعلی در فهرست نیست: گزینه‌ی «بدون تغییر»
+    info.prices["cur"] = day.amount;
+    var cl = h("label","opt cur"); cl.setAttribute("data-base","opt cur");
+    cl.appendChild(radio("cur", true)); cl.appendChild(h("span","tx","بدون تغییر: " + (day.curFood||"")));
+    dayTd.appendChild(cl);
+  }
+  selves.forEach(function(sv){
+    var cell = h("td","cell"), ds = null;
+    day.selves.forEach(function(s){ if(s.id===sv.id) ds = s; });
+    if(ds){
+      ds.foods.forEach(function(f){
+        var value = sv.id + "|" + f.id, l = h("label","opt" + (f.cur ? " cur" : ""));
+        l.setAttribute("data-base", "opt" + (f.cur ? " cur" : ""));
+        var tx = h("span","tx",f.name);
+        if(f.cur){ tx.appendChild(h("span","tick","✓")); info.initial = value; }
+        l.appendChild(radio(value, f.cur)); l.appendChild(tx); l.appendChild(h("span","pr num",fmt(f.price)));
+        info.prices[value] = f.price; info.labels[value] = sv.name + " / " + f.name;
+        cell.appendChild(l);
+      });
+    } else { cell.className = "cell empty"; cell.textContent = "·"; }
+    tr.appendChild(cell);
+  });
+  // لغو رزرو: آخرین ستون و کل سلول
+  var ct = h("td","cancel"), cb = h("label","cbtn");
+  var ci = radio("none", !day.reserved); ci.className = "vh";
+  cb.appendChild(ci); cb.appendChild(h("span","", day.reserved ? "لغو رزرو" : "رزرو نشود")); ct.appendChild(cb); tr.appendChild(ct);
+  info.labels["none"] = day.reserved ? "لغو رزرو" : "رزرو نشود";
+
+  var pv = DATA.preselect && DATA.preselect[name];
+  if(pv){
+    var els = tr.getElementsByTagName("input"), has = false, k;
+    for(k=0;k<els.length;k++) if(els[k].value===pv) has = true;
+    if(has){ for(k=0;k<els.length;k++) els[k].checked = (els[k].value===pv); preApplied++; }
+  }
+  rows.push(info);
+}
 
 function build(){
-  document.getElementById("week").textContent = DATA.week || "";
-  var root = document.getElementById("meals"), tabs = document.getElementById("tabs");
+  rows = []; preApplied = 0;
+  var root = $("meals"), tabs = $("tabs"); root.innerHTML = ""; tabs.innerHTML = "";
+  $("week").textContent = DATA.week || "";
   DATA.meals.forEach(function(meal, mi){
-    var panel = h("div", "panel"), btn = h("button", "tabbtn");
-    panel.id = "panel_" + mi; panel.style.display = "none";
-    btn.type = "button"; btn.id = "tab_" + mi; btn.setAttribute("data-title", meal.title); btn.textContent = meal.title;
+    var panel = h("div","panel"), btn = h("button","tabbtn");
+    panel.id = "panel_" + mi; panel.setAttribute("role","tabpanel"); panel.style.display = "none";
+    btn.type = "button"; btn.id = "tab_" + mi; btn.setAttribute("role","tab"); btn.textContent = meal.title;
     btn.onclick = (function(i){ return function(){ showTab(i); }; })(mi);
     tabs.appendChild(btn); root.appendChild(panel);
-    var table = h("table"), tb = h("tbody");
-    meal.days.forEach(function(day){
-      var tr = h("tr"), dayTd = h("td", "day"), opts = h("td", "opts");
-      dayTd.appendChild(document.createTextNode(day.weekday));
-      dayTd.appendChild(h("br")); dayTd.appendChild(h("small", "", day.date));
-      if(day.reserved){ dayTd.appendChild(h("br")); dayTd.appendChild(h("span", "badge", "رزرو شده")); }
-      tr.appendChild(dayTd); tr.appendChild(opts); tb.appendChild(tr);
-      if(!day.active){ tr.className="off"; opts.textContent="—"; return; }
-      if(day.locked){
-        tr.className="locked";
-        opts.textContent = day.reserved ? ("قفل‌شده - رزرو: " + (day.curFood||"")) : "قفل‌شده";
-        return;
-      }
-      var name = meal.key + "|" + day.date;
-      var info = {meal: meal, day: day, name: name, initial: day.reserved ? "cur" : "none", prices: {}, labels: {}, tr: tr};
-      var hasCur = false;
-      function radio(value, labelNode, checked, cls){
-        var l = h("label", "opt " + (cls||"")), i = h("input");
-        i.type="radio"; i.name=name; i.value=value; i.checked=checked;
-        i.onchange = refresh;
-        var rc=h("span","rc"), tc=h("span","tc"); rc.appendChild(i); tc.appendChild(labelNode); l.appendChild(rc); l.appendChild(tc); opts.appendChild(l); return l;
-      }
-      // اول گزینه‌ی «رزرو نشود»، بعد غذاهای هر سلف
-      var noneLabel = h("span", "none", day.reserved ? "لغو رزرو (رزرو نشود)" : "رزرو نشود");
-      day.selves.forEach(function(s){ s.foods.forEach(function(f){ if(f.cur) hasCur = true; }); });
-      info.labels["none"] = day.reserved ? "لغو رزرو" : "رزرو نشود";
-      radio("none", noneLabel, !day.reserved, "");
-      if(day.reserved && !hasCur){
-        info.prices["cur"] = day.amount;
-        radio("cur", h("span", "cur", "رزرو فعلی بدون تغییر: " + (day.curFood||"")), true, "");
-      }
-      day.selves.forEach(function(s){
-        opts.appendChild(h("div", "selfname", s.name));
-        s.foods.forEach(function(f){
-          var value = s.id + "|" + f.id, span = h("span");
-          span.appendChild(document.createTextNode("- " + f.name + " "));
-          span.appendChild(h("span", "price", fmt(f.price)));
-          if(f.cur){ span.className="cur"; span.appendChild(document.createTextNode(" ")); span.appendChild(h("span","tick","✓")); info.initial = value; }
-          info.prices[value] = f.price; info.labels[value] = s.name + " / " + f.name;
-          radio(value, span, f.cur, "");
-        });
-      });
-      var pv = DATA.preselect && DATA.preselect[meal.key + "|" + day.date];
-      if(pv){
-        var els = opts.getElementsByTagName("input"), has = false, k;  // جدول هنوز به صفحه وصل نشده؛ داخل همین ردیف جست‌وجو می‌کنیم
-        for(k=0;k<els.length;k++) if(els[k].value===pv) has = true;
-        if(has){ for(k=0;k<els.length;k++) els[k].checked = (els[k].value===pv); preApplied++; }
-      }
-      rows.push(info);
-    });
-    table.appendChild(tb); panel.appendChild(table);
+    var selves = selvesOf(meal), wrap = h("div","gridwrap"), table = h("table","grid"), thead = h("thead"), hr = h("tr");
+    hr.appendChild(h("th","dayh","روز"));
+    selves.forEach(function(s){ hr.appendChild(h("th","",s.name)); });
+    hr.appendChild(h("th","cancelh","لغو رزرو"));
+    thead.appendChild(hr); table.appendChild(thead);
+    var tb = h("tbody");
+    meal.days.forEach(function(day){ buildRow(meal, day, selves, tb); });
+    table.appendChild(tb); wrap.appendChild(table); panel.appendChild(wrap);
   });
-  // تب اولی که روزِ قابل‌ویرایش دارد باز می‌شود
-  var first = 0, i, j;
+  var first = 0, i, j;      // اولین تبی که روزِ قابل‌ویرایش دارد
   for(i=0;i<DATA.meals.length;i++){
     var ok = false;
     for(j=0;j<DATA.meals[i].days.length;j++){ var d = DATA.meals[i].days[j]; if(d.active && !d.locked && d.selves.length) ok = true; }
     if(ok){ first = i; break; }
   }
-  showTab(first);
+  showTab(activeTab >= 0 && activeTab < DATA.meals.length ? activeTab : first);
 }
 
 function showTab(k){
+  activeTab = k;
   for(var i=0;i<DATA.meals.length;i++){
-    document.getElementById("panel_" + i).style.display = (i===k) ? "block" : "none";
-    document.getElementById("tab_" + i).className = "tabbtn" + (i===k ? " on" : "");
+    $("panel_" + i).style.display = (i===k) ? "block" : "none";
+    var b = $("tab_" + i); b.className = "tabbtn" + (i===k ? " on" : ""); b.setAttribute("aria-selected", i===k ? "true" : "false");
   }
 }
 
@@ -536,149 +655,196 @@ function current(info){
 }
 
 function calc(){
-  var delta=0, list=[], byMeal = {};
+  var delta = 0, list = [], byMeal = {};
   rows.forEach(function(r){
-    var v = current(r), old = r.day.reserved ? r.day.amount : 0, nw;
+    var v = current(r), old = r.day.reserved ? r.day.amount : 0, nw, changed = (v !== r.initial);
     var labels = r.tr.getElementsByTagName("label");
-    for(var i=0;i<labels.length;i++) labels[i].className = "opt" + (labels[i].getElementsByTagName("input")[0].checked && v!==r.initial ? " chosen" : "");
-    if(v===r.initial) return;
+    for(var i=0;i<labels.length;i++){
+      var base = labels[i].getAttribute("data-base");
+      if(base) labels[i].className = base + (changed && labels[i].getElementsByTagName("input")[0].checked ? " chosen" : "");
+    }
+    if(!changed) return;
     nw = (v==="none") ? 0 : r.prices[v];
     delta += nw - old;
     byMeal[r.meal.key] = (byMeal[r.meal.key] || 0) + 1;
-    list.push(r.day.weekday + " " + r.day.date + " - " + r.meal.title + ": " + (v==="none" ? "لغو رزرو" : r.labels[v]));
+    list.push(r.day.weekday + " " + r.day.date + " · " + r.meal.title + ": " + (v==="none" ? "لغو رزرو" : r.labels[v]));
   });
   return {delta: delta, list: list, byMeal: byMeal};
 }
 
 function refresh(){
   var c = calc(), credit = DATA.credit, after = credit - c.delta, short = c.delta - credit;
-  var nums = document.getElementById("nums");
-  nums.innerHTML = "";
-  function item(label, val, cls){ var s=h("span"); s.appendChild(document.createTextNode(label+": ")); var b=h("b",cls||"",val); s.appendChild(b); nums.appendChild(s); }
-  item("جمع تغییر", sgn(c.delta) + " ریال", "");
-  item("موجودی فعلی", fmt(credit) + " ریال", "");
-  item("پس از ثبت", (after<0?"-":"") + fmt(after) + " ریال", after<0 ? "bad":"good");
-  if(short>0) item("کمبود", fmt(short) + " ریال", "bad");
-  DATA.meals.forEach(function(m, i){  // شمارنده‌ی تغییرات هر سربرگ (تغییرِ تب‌های بسته هم دیده شود)
-    var b = document.getElementById("tab_" + i), n = c.byMeal[m.key] || 0;
-    b.textContent = m.title;
-    if(n){ b.appendChild(h("span", "n", String(n))); }
+  // ترازنامه‌ی موجودی: فیروزه‌ای = می‌ماند، زعفرانی = خرج می‌شود، آجری = کمبود
+  var remainPct = credit > 0 ? Math.max(0, Math.min(100, after / credit * 100)) : 0;
+  var spendPct = credit > 0 ? Math.max(0, Math.min(100 - remainPct, Math.max(0, c.delta) / credit * 100)) : 0;
+  $("mRemain").style.width = short > 0 ? "0%" : (c.delta <= 0 ? 100 : remainPct) + "%";
+  $("mSpend").style.width = short > 0 ? "100%" : spendPct + "%";
+  $("meter").className = "meter" + (short > 0 ? " short" : "");
+  var nums = $("nums"); nums.innerHTML = "";
+  function item(label, val, cls){ var d = h("div"), dt = h("dt","",label), dd = h("dd","num " + (cls||""),val); d.appendChild(dt); d.appendChild(dd); nums.appendChild(d); }
+  item("موجودی", fmt(credit), "");
+  item("تغییر", sgn(c.delta), "");
+  item("پس از ثبت", (after<0 ? "\u2212" : "") + fmt(after), after < 0 ? "bad" : "good");
+  if(short > 0) item("کمبود", fmt(short), "bad");
+  DATA.meals.forEach(function(m, i){
+    var b = $("tab_" + i), n = c.byMeal[m.key] || 0; b.textContent = m.title;
+    if(n) b.appendChild(h("span","n num",String(n)));
   });
-  var ul = document.getElementById("chg"); ul.innerHTML="";
+  var ul = $("chg"); ul.innerHTML = "";
   c.list.forEach(function(t){ ul.appendChild(h("li","",t)); });
-  document.getElementById("go").disabled = busy || c.list.length===0;
+  var chip = $("changes"); chip.hidden = c.list.length === 0; chip.textContent = c.list.length + " تغییر";
+  if(!c.list.length){ ul.hidden = true; chip.setAttribute("aria-expanded","false"); }
+  $("go").disabled = busy || c.list.length === 0;
+  ["reload","refreshcredit","pay"].forEach(function(id){ $(id).disabled = busy; });
+  document.body.style.paddingBottom = ($("dock").offsetHeight + 24) + "px";
 }
 
 function api(method, path, body, cb){
   var x = new XMLHttpRequest();
   x.open(method, path); x.setRequestHeader("X-Token", TOKEN); x.setRequestHeader("Content-Type", "application/json");
-  x.onload = function(){ var j; try{ j=JSON.parse(x.responseText); }catch(e){ j={state:"error", message:"پاسخ نامعتبر از برنامه"}; } cb(j); };
+  x.onload = function(){ var j; try{ j = JSON.parse(x.responseText); }catch(e){ j = {state:"error", message:"پاسخ نامعتبر از برنامه"}; } cb(j); };
   x.onerror = function(){ cb({state:"error", message:"ارتباط با برنامه قطع شد (برنامه بسته شده؟)"}); };
   x.send(body ? JSON.stringify(body) : null);
 }
 
-function show(kind, text){ var o=document.getElementById("out"); o.className=kind; o.textContent=text; o.style.display="block"; window.scrollTo(0,0); }
-
+function bar(pct){
+  var p = h("div", "progress" + (pct < 0 ? " ind" : "")), i = h("i");
+  p.setAttribute("role","progressbar"); p.setAttribute("aria-valuemin","0"); p.setAttribute("aria-valuemax","100");
+  if(pct >= 0){ i.style.width = Math.round(pct) + "%"; p.setAttribute("aria-valuenow", String(Math.round(pct))); }
+  p.appendChild(i); return p;
+}
+function show(kind, text, pct, details){
+  var o = $("out"); o.className = "alert " + kind; o.style.display = "block"; o.innerHTML = "";
+  o.appendChild(h("pre","",text));
+  if(pct !== undefined && pct !== null) o.appendChild(bar(pct));
+  if(details){ var d = h("details"); d.appendChild(h("summary","","مراحل")); d.appendChild(h("pre","",details)); o.appendChild(d); }
+  if(o.scrollIntoView) o.scrollIntoView({block:"nearest"});
+}
+function hideOut(){ $("out").style.display = "none"; }
+function mealTitle(key){ for(var i=0;i<DATA.meals.length;i++) if(DATA.meals[i].key===key) return DATA.meals[i].title; return key; }
 function resultsText(res){
-  var t=[];
+  var t = [];
   res.forEach(function(r){
-    t.push((r.ok?"✓ ":"✗ ") + r.meal + (r.message ? " - پیام سایت: "+r.message : ""));
-    (r.problems||[]).forEach(function(p){ t.push("    ! "+p); });
-    if(r.credit!=null) t.push("    موجودی پس از ذخیره: " + fmt(r.credit) + " ریال");
+    t.push((r.ok ? "✓ " : "✗ ") + mealTitle(r.meal) + (r.message ? " · " + r.message : ""));
+    (r.problems||[]).forEach(function(p){ t.push("   ! " + p); });
+    (r.warnings||[]).forEach(function(p){ t.push("   ؟ " + p); });
   });
   return t.join("\n");
 }
+function setBusy(b){ busy = b; $("go").textContent = b ? "در حال انجام ..." : "ثبت نهایی"; refresh(); }
+function pctOf(j){ return j.progress && j.progress.total ? j.progress.n / j.progress.total * 100 : -1; }
 
-function setBusy(b){ busy=b; document.getElementById("go").textContent = b ? "در حال کار روی سایت ..." : "ثبت نهایی در سایت"; refresh(); }
+function collectChanges(){   // انتخاب‌های تغییرکرده، برای حفظ بعد از «دریافت مجدد»
+  var m = {};
+  rows.forEach(function(r){ var v = current(r); if(v !== r.initial) m[r.name] = v; });
+  return m;
+}
+function fetchData(){
+  api("GET", "/api/data", null, function(j){
+    if(!j.meals){ show("err", "دریافت داده‌ی تازه ناموفق بود."); return; }
+    var keep = manualReload ? collectChanges() : {};
+    DATA = j; DATA.preselect = keep; dataVersion = j.version; build(); refresh();
+    if(manualReload){ show("ok", "منو از سایت بروز شد." + (DATA.notice ? "\n" + DATA.notice : "")); }
+    else if(DATA.notice) show("info", DATA.notice);
+    manualReload = false; autoReload = false; setBusy(false);
+  });
+}
 
 function startPoll(){
   if(poll) clearInterval(poll);
-  poll = setInterval(function(){
-    api("GET", "/api/status", null, function(j){
-      var log = (j.log||[]).join("\n"), stopBtn = document.getElementById("stopwait");
-      if(j.job==="paying"){
-        stopBtn.style.display="inline-block";
-        show("info", "پنجره‌ی پرداخت باز است؛ پرداخت را در صفحه‌ی بانک کامل کن. بعد از برگشت به سایت، خودکار ادامه می‌دهم.\n\n" + log);
-      }
-      else if(j.job==="submitting"){ stopBtn.style.display="none"; show("info", "در حال اعمال تغییرات روی سایت (مرحله به مرحله) ...\n\n" + log); }
-      else if(j.job==="paid"){
-        clearInterval(poll); stopBtn.style.display="none";
-        if(j.paid && j.paid.after!=null){ DATA.credit = j.paid.after; refresh(); }
-        show("ok", "پرداخت موفق بود." + (j.paid && j.paid.after!=null ? "\nاعتبار فعلی: " + fmt(j.paid.after) + " ریال" : "") + (j.paid && j.paid.trace ? "\nکد پیگیری: " + j.paid.trace : "") + "\n\n" + log);
-        setBusy(false);
-      }
-      else if(j.job==="payfailed"){
-        clearInterval(poll); stopBtn.style.display="none";
-        show("err", "پرداخت ناموفق بود: " + ((j.pay && j.pay.message) || "") + "\n\n" + log);
-        setBusy(false);
-      }
-      else if(j.job==="finished"){
-        clearInterval(poll); stopBtn.style.display="none";
-        var pre = (j.paid && j.paid.after!=null) ? ("پرداخت موفق بود (اعتبار فعلی: " + fmt(j.paid.after) + " ریال). سپس:\n") : "";
-        show(j.ok?"ok":"err", pre + (j.ok ? "همه‌ی تغییرات ثبت و تأیید شد. این صفحه و برنامه تا چند ثانیه‌ی دیگر بسته می‌شوند.\n" : "بعضی موارد ثبت نشد:\n") + resultsText(j.results||[]) + "\n\nمراحل انجام‌شده:\n" + log);
-        setBusy(false);
-      } else if(j.job==="idle"){
-        clearInterval(poll); stopBtn.style.display="none";
-        if(log) show("info", log);
-        setBusy(false);
-      }
-    });
-  }, 1500);
+  poll = setInterval(function(){ api("GET", "/api/status", null, handleStatus); }, 1200);
+}
+function stopPoll(){ if(poll){ clearInterval(poll); poll = null; } $("stopwait").style.display = "none"; }
+function tail(log, n){ var l = log ? log.split("\n") : []; return l.slice(-n).join("\n"); }
+
+function handleStatus(j){
+  var log = (j.log || []).join("\n"), stop = $("stopwait");
+  if(j.data_version !== dataVersion){ dataVersion = j.data_version; stopPoll(); fetchData(); return; }
+  if(j.job === "reloading"){ if(!autoReload) show("info", "در حال دریافت منو از سایت ...", pctOf(j)); return; }
+  if(j.job === "paying"){ stop.style.display = ""; show("info", "پنجره‌ی پرداخت باز است؛ پرداخت را در صفحه‌ی بانک کامل کن.", -1, log); return; }
+  if(j.job === "submitting"){ stop.style.display = "none"; show("info", "در حال ثبت روی سایت ...\n" + tail(log, 5), -1); return; }
+  if(j.job === "paid"){
+    stopPoll();
+    if(j.paid && j.paid.after != null){ DATA.credit = j.paid.after; refresh(); }
+    show("ok", "پرداخت موفق بود." + (j.paid && j.paid.after != null ? "\nاعتبار فعلی: " + fmt(j.paid.after) + " ریال" : "") + (j.paid && j.paid.trace ? "\nکد پیگیری: " + j.paid.trace : ""), null, log);
+    $("payrow").className = "pay"; lastShort = 0; setBusy(false); return;
+  }
+  if(j.job === "payfailed"){ stopPoll(); show("err", "پرداخت ناموفق بود: " + ((j.pay && j.pay.message) || ""), null, log); setBusy(false); return; }
+  if(j.job === "finished"){
+    stopPoll();
+    var head = j.ok ? "همه‌ی تغییرات ثبت و تأیید شد." : "بعضی موارد ثبت یا تأیید نشد:";
+    if(j.paid && j.paid.after != null) head = "پرداخت موفق بود (اعتبار: " + fmt(j.paid.after) + " ریال).\n" + head;
+    if(j.ok && DATA.exitWhenDone) head += "\nبرنامه تا چند ثانیه‌ی دیگر بسته می‌شود.";
+    show(j.ok ? "ok" : "err", head + "\n" + resultsText(j.results || []), null, log);
+    lastShort = 0; $("payrow").className = "pay";
+    if(j.ok && DATA.canReload && !DATA.exitWhenDone){ autoReload = true; api("POST", "/api/reload", {}, function(){ startPoll(); }); }
+    else setBusy(false);
+    return;
+  }
+  if(j.job === "idle"){ stopPoll(); if(j.error) show("err", j.error); else if(log) show("info", log); setBusy(false); }
 }
 
-document.getElementById("go").onclick = function(){
+$("go").onclick = function(){
   var c = calc();
-  if(!confirm("این تغییرات روی سایت اصلی اعمال می‌شود:\n\n" + c.list.join("\n") + "\n\nجمع تغییر اعتبار: " + sgn(c.delta) + " ریال\nادامه می‌دهی؟")) return;
+  if(!confirm("ثبت این تغییرات؟\n\n" + c.list.join("\n") + "\n\nجمع تغییر: " + sgn(c.delta) + " ریال")) return;
   var sels = rows.map(function(r){ return {meal: r.meal.key, date: r.day.date, value: current(r)}; });
   setBusy(true);
   api("POST", "/api/submit", {selections: sels}, function(j){
-    if(j.state==="started"){
-      show("info", "شروع شد ...");
-      startPoll();
-    } else if(j.state==="insufficient"){
-      DATA.credit = j.credit; refresh();
-      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در فایل pending.json ذخیره شد." + (j.canPay ? "\nمی‌توانی از «پرداخت اینترنتی» پایین صفحه پرداخت کنی (بعد از پرداخت موفق، خودکار رزرو می‌شود)، یا بعد از شارژ از راه دیگر «بروزرسانی موجودی» و دوباره «ثبت نهایی» را بزن." : "\nبعد از شارژ، «بروزرسانی موجودی» و دوباره «ثبت نهایی» را بزن."));
+    if(j.state === "started"){ show("info", "شروع شد ...", -1); startPoll(); }
+    else if(j.state === "insufficient"){
+      DATA.credit = j.credit; lastShort = j.shortfall; refresh();
+      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در pending.json ذخیره شد.");
       if(j.canPay){
-        var amt = Math.max(10000, Math.ceil(j.shortfall/1000)*1000);
-        document.getElementById("payamt").value = fmt(amt);
-        document.getElementById("payrow").style.display = "block";
+        $("payamt").value = fmt(Math.max(10000, Math.ceil(j.shortfall / 1000) * 1000));
+        $("payrow").className = "pay need"; $("payamt").focus();
       }
       setBusy(false);
-    } else if(j.state==="nochange"){ show("info", "تغییری انتخاب نشده است."); setBusy(false); }
+    } else if(j.state === "nochange"){ show("info", "تغییری انتخاب نشده است."); setBusy(false); }
     else { show("err", j.message || "خطا"); setBusy(false); }
   });
 };
-document.getElementById("topgo").onclick = function(){
-  var amt = parseInt(String(document.getElementById("topamt").value).replace(/[^0-9]/g,""), 10) || 0;
-  if(amt<=0){ alert("مبلغ را وارد کن."); return; }
-  if(!confirm("مبلغ " + fmt(amt) + " ریال به درگاه پرداخت فرستاده می‌شود.\nپرداخت را خودت در پنجره‌ی بانک کامل می‌کنی.\nادامه می‌دهی؟")) return;
-  api("POST", "/api/topup", {amount: amt}, function(j){
-    if(j.state==="paying"){ busy=true; refresh(); show("info","در حال باز کردن پنجره‌ی پرداخت ..."); startPoll(); }
+$("pay").onclick = function(){
+  var amt = parseAmt($("payamt").value);
+  if(amt <= 0){ $("payamt").focus(); return; }
+  var reserveAfter = lastShort > 0 && amt >= lastShort;
+  if(!confirm("پرداخت " + fmt(amt) + " ریال" + (reserveAfter ? "\nبعد از پرداخت موفق، انتخاب‌ها خودکار ثبت می‌شوند." : "") + "؟")) return;
+  api("POST", reserveAfter ? "/api/pay" : "/api/topup", {amount: amt}, function(j){
+    if(j.state === "paying"){ busy = true; refresh(); show("info", "در حال باز کردن پنجره‌ی پرداخت ...", -1); startPoll(); }
     else show("err", j.message || "خطا");
   });
 };
-document.getElementById("pay").onclick = function(){
-  var amt = parseInt(String(document.getElementById("payamt").value).replace(/[^0-9]/g,""), 10) || 0;
-  if(!confirm("مبلغ " + fmt(amt) + " ریال به درگاه پرداخت فرستاده می‌شود.\nپرداخت را خودت در پنجره‌ی بانک کامل می‌کنی؛ بعد از پرداخت موفق، همین غذاها خودکار رزرو می‌شوند.\nادامه می‌دهی؟")) return;
-  api("POST", "/api/pay", {amount: amt}, function(j){
-    if(j.state==="paying"){ document.getElementById("payrow").style.display="none"; busy=true; refresh(); show("info","در حال باز کردن پنجره‌ی پرداخت ..."); startPoll(); }
-    else show("err", j.message || "خطا");
-  });
+$("payamt").oninput = function(){ var n = parseAmt(this.value); this.value = n ? fmt(n) : ""; };
+$("stopwait").onclick = function(){
+  api("POST", "/api/cancel", {}, function(){ stopPoll(); show("info", "پرداخت لغو شد."); setBusy(false); });
 };
-document.getElementById("stopwait").onclick = function(){
-  api("POST", "/api/cancel", {}, function(){ if(poll) clearInterval(poll); document.getElementById("stopwait").style.display="none"; show("info","پرداخت لغو شد و پنجره بسته شد. اگر قبلاً پرداخت کرده‌ای، «بروزرسانی موجودی» را بزن. انتخاب‌های ذخیره‌شده در pending.json مانده است."); setBusy(false); });
-};
-
-document.getElementById("refreshcredit").onclick = function(){
+$("refreshcredit").onclick = function(){
   var b = this; b.disabled = true;
   api("POST", "/api/credit", {}, function(j){
     b.disabled = false;
-    if(j.state==="credit"){ DATA.credit = j.credit; refresh(); show("ok", "موجودی بروز شد: " + fmt(j.credit) + " ریال"); }
+    if(j.state === "credit"){ DATA.credit = j.credit; refresh(); show("ok", "موجودی بروز شد: " + fmt(j.credit) + " ریال"); }
     else show("err", j.message || "خطا");
   });
 };
-if(DATA.canPay) document.getElementById("topup").style.display="block";
+$("reload").onclick = function(){
+  manualReload = true; setBusy(true);
+  api("POST", "/api/reload", {}, function(j){
+    if(j.state === "reloading"){ show("info", "در حال دریافت منو از سایت ...", -1); startPoll(); }
+    else { manualReload = false; show("err", j.message || "خطا"); setBusy(false); }
+  });
+};
+$("paytoggle").onclick = function(){
+  var r = $("payrow"), open = r.className.indexOf("open") < 0;
+  r.className = "pay" + (open ? " open" : "") + (r.className.indexOf("need") >= 0 ? " need" : ""); this.setAttribute("aria-expanded", open ? "true" : "false"); refresh();
+};
+$("changes").onclick = function(){
+  var ul = $("chg"); ul.hidden = !ul.hidden; this.setAttribute("aria-expanded", ul.hidden ? "false" : "true");
+};
+document.onkeydown = function(e){ if(e.key === "Escape"){ $("chg").hidden = true; $("changes").setAttribute("aria-expanded","false"); } };
+window.onresize = function(){ document.body.style.paddingBottom = ($("dock").offsetHeight + 24) + "px"; };
+
+if(DATA.canPay){ $("payrow").hidden = false; $("paytoggle").hidden = false; }
+if(DATA.canReload) $("reload").style.display = "";
 build(); refresh();
-if(DATA.notice || preApplied>0) show("info", (DATA.notice ? DATA.notice + "\n" : "") + (preApplied>0 ? ("انتخاب‌های ذخیره‌شده‌ی قبلی (" + preApplied + " مورد) اعمال شد؛ بررسی کن و «ثبت نهایی» را بزن.") : ""));
+if(DATA.notice || preApplied > 0) show("info", (DATA.notice ? DATA.notice + "\n" : "") + (preApplied > 0 ? preApplied + " انتخاب ذخیره‌شده اعمال شد." : ""));
 </script></body></html>
 """

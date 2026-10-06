@@ -201,7 +201,9 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
     say = on_step or (lambda _m: None)
     if html is None:
         html = _open_week(session, url, {c.date for c in choices})
+    before = parse_page(html)        # وضعیت و اعتبار پیش از ثبت (برای بررسی نهایی)
     results = []
+    verified: list[Choice] = []      # انتخاب‌هایی که هر وعده‌شان بعد از ذخیره تأیید شد
     for meal_key in dict.fromkeys(c.meal for c in choices):
         chs = [c for c in choices if c.meal == meal_key]
         say(f"▶ وعده {chs[0].meal_title or meal_key}")
@@ -257,7 +259,46 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
             say(f"  پیام سایت: {after.message}")
         results.append({"meal": meal_key, "ok": not problems, "message": after.message, "problems": problems,
                         "credit": after.credit})
+        verified += [ch for ch, _chk in applied if _row_ok(after, ch) and find_day(after, ch.meal, ch.date).reserved == ch.reserve]
+
+    if verified:
+        results.append(_final_check(session, url, before, verified, say))
     return results
+
+
+def _final_check(session, url: str, before: WeekMenu, verified: list[Choice], say) -> dict:
+    """
+    بررسی نهایی: بعد از ذخیره‌ی همه‌ی وعده‌ها، صفحه‌ی هفته یک بار دیگر تازه از سایت خوانده می‌شود
+    (نه از پاسخ ذخیره) و همه‌ی تغییرها دوباره با آن مقایسه می‌شود؛ اعتبار نهایی هم با پیش‌بینی سنجیده می‌شود.
+    """
+    say("▶ بررسی نهایی از روی سایت")
+    problems: list[str] = []
+    warnings: list[str] = []
+    credit = None
+    try:
+        final = parse_page(_open_week(session, url, {c.date for c in verified}))
+    except Exception as e:  # noqa: BLE001
+        say(f"  ✗ خواندن دوباره‌ی صفحه ناموفق بود: {type(e).__name__}: {e}")
+        return {"meal": "بررسی نهایی", "ok": False, "message": None, "credit": None, "warnings": [],
+                "problems": [f"خواندن دوباره‌ی صفحه ناموفق بود: {type(e).__name__}: {e}"]}
+    for ch in verified:
+        d = find_day(final, ch.meal, ch.date)
+        ok = d is not None and d.reserved == ch.reserve and _row_ok(final, ch)
+        say(f"  {ch.weekday} {ch.date} · {ch.meal_title}: " + ("✓ تأیید شد" if ok else "✗ با سایت یکی نیست"))
+        if not ok:
+            problems.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): در سایت وضعیت دیگری دیده شد")
+    credit = final.credit
+    try:
+        expected = (before.credit or 0) - price_delta(before, verified)
+        if before.credit is not None and credit is not None and credit != expected:
+            warnings.append(f"اعتبار نهایی {credit:,} با پیش‌بینی {expected:,} ریال نمی‌خواند؛ در سایت چک کن")
+            say(f"  ؟ {warnings[-1]}")
+    except LookupError:
+        pass
+    if credit is not None:
+        say(f"  اعتبار نهایی: {credit:,} ریال")
+    return {"meal": "بررسی نهایی", "ok": not problems, "message": None, "problems": problems, "warnings": warnings,
+            "credit": credit}
 
 
 # ------------------------------------------------------ ذخیره‌ی انتخاب‌ها (موجودی کم)

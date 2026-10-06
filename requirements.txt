@@ -1,0 +1,9 @@
+# نصب: pip install -r requirements.txt
+# (Python 3.10 یا بالاتر؛ برای ورود و پرداخت، Google Chrome هم باید نصب باشد)
+selenium>=4.6          # لاگین و پنجره‌ی پرداخت (chromedriver را خودش مدیریت می‌کند)
+requests>=2.31         # همه‌ی درخواست‌ها بعد از ورود
+beautifulsoup4>=4.12   # خواندن صفحه‌های سایت
+lxml>=4.9              # پارسر سریع برای beautifulsoup4
+opencv-python>=4.8     # تشخیص کپچا
+numpy>=1.24            # تشخیص کپچا
+scikit-image>=0.21     # تشخیص کپچا (SSIM)

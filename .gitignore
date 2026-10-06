@@ -2,3 +2,4 @@
 venv
 src/__pycache__
 menu.html
+pending.json

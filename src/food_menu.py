@@ -20,6 +20,8 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+from ui import BASE_CSS, GRID_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
+
 RESERVATION_URL = "https://jeton.yazd.ac.ir/Reservation/Reservation.aspx"
 WEEK_BUTTONS = {"next": "imgbtnNextWeek"}  # "current" = همان GET اولیه
 TABLE_ID_RE = re.compile(r"^cphMain_grdReservation(\w+)$")
@@ -27,27 +29,33 @@ FOOD_RE = re.compile(r"^(?P<name>.*?)\s+(?P<price>[\d,٬]+)\s*ریال\s*$")
 PLACEHOLDER = "-1"  # روزهای غیرفعال (جمعه و ...)
 
 
-# سربرگ هر وعده در فایل HTML خروجی (بدون JS همه‌ی وعده‌ها پشت‌سرهم دیده می‌شوند)
-_TABS_JS = """<script>
-(function(){
-  var panels = document.querySelectorAll(".panel"), box = document.getElementById("tabs"), i;
+# فایل منو: سربرگ هر وعده (بدون JS همه‌ی وعده‌ها پشت‌سرهم دیده می‌شوند)
+_MENU_CSS = """
+.f{padding:3px 8px}.f.cur{font-weight:700}
+.alert{margin:6px 0 12px}
+.js .panel h2{display:none}
+@media print{#tabs,#theme{display:none}.panel{display:block !important}.js .panel h2{display:block}body{background:#fff}}
+"""
+
+_MENU_JS = """(function(){
+  var panels = document.querySelectorAll(".panel"), box = document.getElementById("tabs");
   if(!panels.length || !box) return;
   document.body.className += " js";
   function show(k){
     for(var j=0;j<panels.length;j++){
       panels[j].style.display = (j===k) ? "block" : "none";
       box.children[j].className = "tabbtn" + (j===k ? " on" : "");
+      box.children[j].setAttribute("aria-selected", j===k ? "true" : "false");
     }
   }
-  for(i=0;i<panels.length;i++){
+  for(var i=0;i<panels.length;i++){
     var b = document.createElement("button"); b.type = "button"; b.className = "tabbtn";
     b.textContent = panels[i].getAttribute("data-title");
     b.onclick = (function(k){ return function(){ show(k); }; })(i);
     box.appendChild(b);
   }
   show(0);
-})();
-</script>"""
+})();"""
 
 
 # ----------------------------------------------------------------- مدل‌ها
@@ -134,62 +142,55 @@ class WeekMenu:
         return "\n".join(out)
 
     def to_html(self) -> str:
-        """یک صفحه‌ی HTML مستقل و راست‌به‌چپ؛ با مرورگر باز کن یا چاپ بگیر."""
+        """صفحه‌ی HTML مستقل و راست‌به‌چپ: هر وعده یک سربرگ، در هر روز هر سلف ستون خودش را دارد. تم روشن/تاریک دارد."""
         e = escape
-        parts = [
+        out = [
             '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">',
-            f"<title>برنامه غذایی {e(self.week_range or '')}</title>",
-            "<style>"
-            "body{font-family:Vazirmatn,Tahoma,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;color:#222}"
-            "h1{font-size:20px;margin:0 0 8px;overflow:visible}h2{font-size:17px;margin:28px 0 8px;border-right:4px solid #2e7d32;padding-right:8px}"
-            "table{width:100%;border-collapse:collapse}th,td{border:1px solid #ccc;padding:6px 8px;vertical-align:top;text-align:right}"
-            "th{background:#f0f0f0}.day{white-space:nowrap;font-weight:bold}.off{color:#999;background:#fafafa}"
-            ".res td.day,.res td.self{background:#e8f5e9}.sel{font-weight:bold}.tick{color:#2e7d32;font-weight:bold}"
-            ".self{white-space:nowrap}.price{color:#777;font-size:12px}.food{display:block;margin:3px 0}"
-            ".note{background:#fff8e1;border:1px solid #ffe082;padding:10px;border-radius:6px}.legend{color:#666;font-size:12px}"
-            "#tabs{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 0;border-bottom:2px solid #2e7d32}"
-            ".tabbtn{font-family:inherit;font-size:15px;background:#eceff1;color:#333;border:1px solid #cfd8dc;padding:7px 18px;border-radius:8px 8px 0 0;cursor:pointer}"
-            ".tabbtn.on{background:#2e7d32;color:#fff;border-color:#2e7d32}"
-            ".js h2{display:none}"
-            "@media print{#tabs{display:none}.js h2{display:block}.panel{display:block !important}}"
-            "</style></head><body>",
-            f"<h1>برنامه غذایی هفته <bdi>{e(self.week_range or '')}</bdi></h1>",
+            '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">',
+            f"<title>برنامه غذایی {e(self.week_range or '')}</title>", THEME_BOOT,
+            f"<style>{BASE_CSS}{GRID_CSS}{_MENU_CSS}</style></head><body><div class=\"wrap\">",
+            f'<header class="top"><div><span class="eyebrow">برنامه غذایی</span><h1><bdi>{e(self.week_range or "")}</bdi></h1></div>'
+            f'<div class="tools">{THEME_BUTTON}</div></header>',
         ]
         if self.message:
-            parts.append(f'<p class="note">{e(self.message)}</p>')
+            out.append(f'<div class="alert info">{e(self.message)}</div>')
         if not self.has_food:
-            parts.append('<p class="note">هنوز غذایی برای این هفته ثبت نشده است.</p>')
+            out.append('<div class="alert info">هنوز غذایی برای این هفته ثبت نشده است.</div>')
         else:
-            parts.append('<p class="legend">سبز = رزرو شده &nbsp;|&nbsp; <b>پررنگ</b> با <span class="tick">✓</span> = غذای انتخاب‌شده/پیش‌فرض</p>')
-            parts.append('<div id="tabs"></div>')
+            out.append('<nav id="tabs" role="tablist"></nav>')
             for mi, m in enumerate(self.meals):
-                parts.append(f'<div class="panel" id="panel_{mi}" data-title="{e(m.title)}">')
-                parts.append(f"<h2>{e(m.title)}</h2><table><tr><th>روز</th><th>سلف</th><th>غذاها</th></tr>")
+                cols: list = []  # ستون‌ها: هر سلفی که در این وعده در یک روز غذا دارد (به ترتیب دیده‌شدن)
                 for d in m.days:
-                    day = f"{e(d.weekday)}<br><small>{e(d.date)}</small>"
-                    rows = [s for s in d.selves if s.foods] or [None]
-                    for i, s in enumerate(rows):
-                        cls = "res" if d.reserved else ("off" if not d.active else "")
-                        parts.append(f'<tr class="{cls}">')
-                        if i == 0:
-                            parts.append(f'<td class="day" rowspan="{len(rows)}">{day}</td>')
-                        if s is None:
-                            parts.append('<td colspan="2">—</td></tr>')
+                    for sv in d.selves:
+                        if sv.foods and sv.id not in [c[0] for c in cols]:
+                            cols.append((sv.id, sv.name))
+                head = "".join(f"<th>{e(n)}</th>" for _, n in cols)
+                out.append(f'<section class="panel" id="panel_{mi}" data-title="{e(m.title)}"><h2>{e(m.title)}</h2>'
+                           f'<div class="gridwrap"><table class="grid"><thead><tr><th class="dayh">روز</th>{head}</tr></thead><tbody>')
+                for d in m.days:
+                    badge = '<span class="badge">رزرو شده</span>' if d.reserved else ""
+                    day = f'<td class="day"><strong>{e(d.weekday)}</strong><span class="dt">{e(d.date)}</span>{badge}</td>'
+                    cls = "res" if d.reserved else ("off" if not d.active else "")
+                    if not d.active or not cols:
+                        out.append(f'<tr class="{cls}">{day}<td class="msg" colspan="{max(len(cols), 1)}">—</td></tr>')
+                        continue
+                    cells = []
+                    for sid, _ in cols:
+                        sv = next((x for x in d.selves if x.id == sid and x.foods), None)
+                        if sv is None:
+                            cells.append('<td class="cell empty">·</td>')
                             continue
                         foods = "".join(
-                            f'<span class="food{" sel" if f.selected else ""}">- {e(f.name)}'
-                            + (f' <span class="price">{f.price:,}</span>' if f.price else "")
-                            + (' <span class="tick">✓</span>' if f.selected else "")
-                            + "</span>"
-                            for f in s.foods
+                            f'<div class="f{" cur" if f.selected else ""}">- {e(f.name)}'
+                            + (f' <span class="pr num">{f.price:,}</span>' if f.price else "")
+                            + ('<span class="tick">✓</span>' if f.selected else "") + "</div>"
+                            for f in sv.foods
                         )
-                        name = f"<b>{e(s.name)}</b>" if s.selected else e(s.name)
-                        parts.append(f'<td class="self">{name}</td><td>{foods}</td></tr>')
-                parts.append("</table></div>")
-            parts.append(_TABS_JS)
-        parts.append("</body></html>")
-        return "\n".join(parts)
-
+                        cells.append(f'<td class="cell">{foods}</td>')
+                    out.append(f'<tr class="{cls}">{day}{"".join(cells)}</tr>')
+                out.append("</tbody></table></div></section>")
+        out.append(f"</div><script>{THEME_TOGGLE_JS}\n{_MENU_JS}</script></body></html>")
+        return "".join(out)
 
 # ----------------------------------------------------------------- پارس
 def _int(text: str) -> Optional[int]:
@@ -386,3 +387,4 @@ def fetch_menu_with_fallback(session, week: str, **kw) -> tuple[WeekMenu, Option
         if current.has_food:
             return current, fallback_notice(menu, current)
     return menu, None
+

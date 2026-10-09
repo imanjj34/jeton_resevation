@@ -72,7 +72,7 @@ OPTIONS: list[Opt] = [
     Opt("login", "eager_load", True, "bool",
         "صفحه‌ی ورود را بدون انتظار برای همه‌ی منابع باز کن (سریع‌تر). اگر ورود مشکل پیدا کرد false کن."),
     Opt("login", "retries", 5, "int", "تعداد تلاش برای ورود (کپچا گاهی اشتباه تشخیص داده می‌شود).", lo=1, hi=20),
-    Opt("login", "captcha_dataset", r"C:\Users\iman\Documents\project\image vision\dataset", "path",
+    Opt("login", "captcha_dataset", r"..\dataset", "path",
         "پوشه‌ی دیتاست تصاویر مرجع کپچا (زیرپوشه‌هایی به نام ارقام).", ask=True),
     Opt("login", "captcha_threshold", 0.4, "float", "کمترین شباهت (SSIM) برای پذیرفتن یک رقم کپچا.", lo=0, hi=1),
     Opt("login", "chromedriver_path", "", "path",
@@ -175,7 +175,7 @@ class Config:
                 return os.environ.get("JETON_PASS") or v[name]
             return v[name]
         base = v["base_url"].rstrip("/") + "/"
-        derived = {"home_url": base + "Master/Default.aspx", "epay_url": base + "ePay/ePay_Payment.aspx",
+        derived = {"home_url": [base + "Master/Default.aspx", base + "MyCullinan/ChangePassword.aspx?mustRelogin=true"], "epay_url": base + "ePay/ePay_Payment.aspx",
                    "reservation_url": base + "Reservation/Reservation.aspx"}
         if name in derived:
             return derived[name]
@@ -197,7 +197,7 @@ cfg = Config()
 
 def config_path() -> Path:
     env = os.environ.get("JETON_CONFIG")
-    return Path(env).expanduser() if env else Path(__file__).resolve().with_name("config.ini")
+    return Path(env).expanduser() if env else Path(__file__).resolve().parent.parent / "config.ini"
 
 
 def load(path: str | os.PathLike | None = None) -> Config:

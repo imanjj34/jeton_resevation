@@ -3,3 +3,8 @@ venv
 src/__pycache__
 menu.html
 pending.json
+src/config.ini
+config.ini
+Jeton.spec
+build
+dist

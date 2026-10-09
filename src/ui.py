@@ -59,7 +59,7 @@ _BASE_CSS_TPL = """
 *{box-sizing:border-box}
 html{color-scheme:light dark;font-size:var(--root,16px)}
 [data-theme="light"]{color-scheme:light}[data-theme="dark"]{color-scheme:dark}
-body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font);font-size:1rem;line-height:1.75;
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font);font-size:0.9rem;line-height:1.75;
   -webkit-font-smoothing:antialiased}
 h1,h2,h3,p{margin:0}
 bdi,.num,input[inputmode]{font-variant-numeric:tabular-nums}

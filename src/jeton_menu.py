@@ -33,7 +33,6 @@ from web_select import SelectionServer
 cv2 = np = ssim = webdriver = By = WebDriverWait = Service = TimeoutException = None
 _heavy_lock = threading.Lock()
 
-
 def _load_heavy() -> None:
     global cv2, np, ssim, webdriver, By, WebDriverWait, Service, TimeoutException
     with _heavy_lock:
@@ -139,7 +138,7 @@ def _try_login(driver, username: str, password: str) -> bool:
     captcha_input.send_keys(captcha)
     driver.find_element(By.ID, "btnEncript").click()
     try:
-        WebDriverWait(driver, 5, poll_frequency=0.1).until(lambda d: d.current_url == cfg.home_url)
+        WebDriverWait(driver, 5, poll_frequency=0.1).until(lambda d: d.current_url in cfg.home_url)
         return True
     except TimeoutException:
         return False

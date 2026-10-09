@@ -14,12 +14,12 @@ import threading
 import time
 
 from food_menu import fallback_notice
-from ui import BASE_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
+from config import cfg
+from ui import THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
 from web_select import SelectionServer
-from reserve import PENDING_FILE, Choice, load_pending
+from reserve import Choice, load_pending
 
 MODES = ("reserve", "file", "pending")
-PREFETCH_MAX_AGE = 600  # ثانیه؛ منوی پیش‌دریافت‌شده‌ی کهنه‌تر از این دور ریخته می‌شود
 
 
 def choices_to_preselect(choices: list[Choice]) -> dict:
@@ -70,7 +70,7 @@ class AppServer(SelectionServer):
     def page(self) -> bytes:
         if self.menu is not None:
             return super().page()
-        html = (WIZARD.replace("__THEME_BOOT__", THEME_BOOT).replace("__BASE_CSS__", BASE_CSS)
+        html = (WIZARD.replace("__THEME_BOOT__", theme_boot()).replace("__BASE_CSS__", base_css())
                 .replace("__THEME_JS__", THEME_TOGGLE_JS).replace("__THEME_BUTTON__", THEME_BUTTON)
                 .replace("__TOKEN__", self.token))
         return html.encode("utf-8")
@@ -160,7 +160,7 @@ class AppServer(SelectionServer):
         if mode not in MODES or week not in ("current", "next"):
             return {"state": "error", "message": "گزینه‌ی نامعتبر."}
         if mode == "pending" and not load_pending():
-            return {"state": "error", "message": f"فایل {PENDING_FILE} خالی است یا وجود ندارد."}
+            return {"state": "error", "message": f"فایل {cfg.pending_file} خالی است یا وجود ندارد."}
         name = os.path.basename(str(body.get("filename") or "menu.html")) or "menu.html"
         self.job.update(job="working", log=[], error=None, progress=None, file=None)
         threading.Thread(target=self._start_job, args=(mode, week, name), daemon=True).start()
@@ -178,7 +178,7 @@ class AppServer(SelectionServer):
             self._log(f"منوی {self._title(week)} در پس‌زمینه در حال دریافت است؛ منتظر تکمیلش می‌مانم ...")
         self._pf_done.wait()
         menu = self._pf_menus.pop(week, None)
-        if menu is not None and time.time() - self._pf_time < PREFETCH_MAX_AGE:
+        if menu is not None and time.time() - self._pf_time < cfg.prefetch_max_age:
             self._log(f"منوی {self._title(week)} آماده بود ✓")
             return menu
         return None
@@ -263,18 +263,19 @@ __THEME_BOOT__
 __BASE_CSS__
 .shell{max-width:620px;margin:0 auto;padding:28px 16px 60px}
 header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px}
-h1{font-size:26px;font-weight:700;line-height:1.3}
+.tools{display:flex;gap:8px;align-items:center}
+h1{font-size:1.625rem;font-weight:700;line-height:1.3}
 .steps{display:flex;gap:0;list-style:none;margin:0 0 18px;padding:0}
-.steps li{flex:1;padding:8px 0 10px;border-bottom:3px solid var(--line);color:var(--muted);font-size:13px;text-align:right}
-.steps li b{display:block;font-size:12px;font-weight:700;color:var(--muted)}
+.steps li{flex:1;padding:8px 0 10px;border-bottom:3px solid var(--line);color:var(--muted);font-size:0.812rem;text-align:right}
+.steps li b{display:block;font-size:0.75rem;font-weight:700;color:var(--muted)}
 .steps li.done{border-bottom-color:var(--leaf);color:var(--ink)}.steps li.done b{color:var(--leaf)}
 .steps li.on{border-bottom-color:var(--tile);color:var(--ink);font-weight:700}.steps li.on b{color:var(--tile)}
 #bg{display:none;margin:0 0 14px}
 #err{display:none;margin:0 0 14px}
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px}
-.panel h2{font-size:18px;margin-bottom:14px}
+.panel h2{font-size:1.125rem;margin-bottom:14px}
 .field{display:block;margin:0 0 14px}
-.field>span{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
+.field>span{display:block;font-size:0.812rem;color:var(--muted);margin-bottom:4px}
 .list{display:grid;gap:8px;margin:0 0 16px}
 .opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);cursor:pointer}
 .opt:hover{border-color:var(--muted)}
@@ -284,16 +285,16 @@ h1{font-size:26px;font-weight:700;line-height:1.3}
 .seg span{display:block;padding:8px 18px;color:var(--muted);font-weight:700}
 .seg input:checked+span{background:var(--tile);color:var(--tile-ink)}
 .seg input:focus-visible+span{outline:3px solid var(--tile);outline-offset:-3px}
-.label{font-size:13px;color:var(--muted);margin:0 0 6px}
+.label{font-size:0.812rem;color:var(--muted);margin:0 0 6px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .working h2{margin-bottom:6px}
-.working p{color:var(--muted);font-size:14px;min-height:1.6em}
+.working p{color:var(--muted);font-size:0.875rem;min-height:1.6em}
 .result{margin-top:14px}
 </style></head><body>
 <div class="shell">
-<header class="top"><h1>سامانه‌ی تغذیه</h1>__THEME_BUTTON__</header>
+<header class="top"><h1>سامانه‌ی تغذیه</h1><div class="tools">__THEME_BUTTON__</div></header>
 <ol class="steps" id="steps"></ol>
-<div id="bg" class="alert info" role="status"></div>
+<div id="bg" class="alert info" role="status"><div id="bgText"></div><div id="bgBar" class="progress" hidden><i></i></div></div>
 <div id="err" class="alert err" role="alert"></div>
 <div id="view"></div>
 </div>
@@ -309,12 +310,14 @@ function api(method, path, body, cb){
   x.send(body ? JSON.stringify(body) : null);
 }
 function pct(p){ return p && p.total ? p.n / p.total * 100 : -1; }
-function bar(p){
-  var b = h("div", "progress" + (p < 0 ? " ind" : "")), i = h("i");
-  b.setAttribute("role","progressbar"); b.setAttribute("aria-valuemin","0"); b.setAttribute("aria-valuemax","100");
-  if(p >= 0){ i.style.width = Math.round(p) + "%"; b.setAttribute("aria-valuenow", String(Math.round(p))); }
-  b.appendChild(i); return b;
+function setBar(el, p){        // یک عنصر ثابت؛ فقط حالتش عوض می‌شود (انیمیشن با هر به‌روزرسانی از اول شروع نمی‌شود)
+  if(p === null || p === undefined){ el.hidden = true; return; }
+  el.hidden = false;
+  var i = el.firstChild;
+  if(p < 0){ if(el.className.indexOf("ind") < 0) el.className = "progress ind"; i.style.width = ""; el.removeAttribute("aria-valuenow"); }
+  else { if(el.className.indexOf("ind") >= 0) el.className = "progress"; i.style.width = Math.round(p) + "%"; el.setAttribute("aria-valuenow", String(Math.round(p))); }
 }
+function mkBar(){ var b = h("div","progress"); b.setAttribute("role","progressbar"); b.setAttribute("aria-valuemin","0"); b.setAttribute("aria-valuemax","100"); b.appendChild(h("i")); return b; }
 function field(label, input){ var l = h("label","field"); l.appendChild(h("span","",label)); l.appendChild(input); return l; }
 function val(name){ var e=document.getElementsByName(name); for(var i=0;i<e.length;i++) if(e[i].checked) return e[i].value; return null; }
 function showErr(t){ var e = $("err"); e.style.display = t ? "block" : "none"; e.textContent = t || ""; }
@@ -394,7 +397,8 @@ function renderBusy(st){
   setSteps(3);
   var v = $("view"); v.innerHTML = "";
   var c = h("div","panel working"); c.id = "busy"; c.appendChild(h("h2","","در حال دریافت منو"));
-  c.appendChild(h("p","")); c.appendChild(bar(-1)); v.appendChild(c);
+  var pp = h("p",""); pp.id = "busyText"; c.appendChild(pp);
+  var bb = mkBar(); bb.id = "busyBar"; c.appendChild(bb); setBar(bb, -1); v.appendChild(c);
 }
 
 function banner(st){
@@ -408,8 +412,10 @@ function banner(st){
       else if(g.prefetch === "done") t += g.fallback ? " · هفته بعد خالی است؛ منوی هفته جاری آماده است" : " · منوی " + w + " آماده است";
     }
   }
-  b.style.display = t ? "block" : "none"; b.className = "alert " + (ok ? "ok" : "info"); b.innerHTML = "";
-  if(t){ b.appendChild(h("div","",t)); if(p !== null && st.job !== "working") b.appendChild(bar(p)); }  // هنگام «دریافت منو» نوار فقط در کارت اصلی می‌آید
+  b.style.display = t ? "block" : "none";
+  var cls = "alert " + (ok ? "ok" : "info"); if(b.className !== cls) b.className = cls;
+  if($("bgText").textContent !== t) $("bgText").textContent = t;
+  setBar($("bgBar"), st.job === "working" ? null : p);   // هنگام «دریافت منو» نوار فقط در کارت اصلی می‌آید
 }
 
 function render(st){
@@ -423,7 +429,7 @@ function render(st){
   }
   if(want === "busy"){
     var c = $("busy");
-    if(c){ c.getElementsByTagName("p")[0].textContent = (st.log || []).slice(-1)[0] || ""; var old = c.getElementsByClassName("progress")[0]; c.replaceChild(bar(pct(st.progress)), old); }
+    if(c){ var tx = (st.log || []).slice(-1)[0] || ""; if($("busyText").textContent !== tx) $("busyText").textContent = tx; setBar($("busyBar"), pct(st.progress)); }
   }
   return true;
 }

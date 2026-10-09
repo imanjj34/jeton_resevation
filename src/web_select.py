@@ -21,7 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from food_menu import WeekMenu, fallback_notice
-from ui import BASE_CSS, GRID_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
+from config import cfg
+from ui import GRID_CSS, THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
 from reserve import (Choice, _is_noop, clear_pending, find_day, find_meal, open_week_state, price_delta,
                      read_credit, save_pending, submit, summary_lines)
 
@@ -198,7 +199,7 @@ class SelectionServer:
 
             save_pending(choices)
             self.pending_choices, self.shortfall = choices, delta - credit
-            return {"state": "insufficient", "shortfall": self.shortfall, "canPay": self.pay_opener is not None, **base}
+            return {"state": "insufficient", "shortfall": self.shortfall, "canPay": self.pay_opener is not None, "pendingFile": cfg.pending_file, **base}
 
     def _submit_job(self, choices: list[Choice], html: str | None = None) -> None:
         """ثبت مرحله‌به‌مرحله روی سایت؛ پیشرفت زنده از طریق self.job['log'] به صفحه می‌رسد.
@@ -361,7 +362,7 @@ class SelectionServer:
     def page(self) -> bytes:
         data = json.dumps(self.data(), ensure_ascii=False).replace("</", "<\\/")
         data = data.replace("\u2028", "\\u2028")
-        html = (PAGE.replace("__THEME_BOOT__", THEME_BOOT).replace("__BASE_CSS__", BASE_CSS).replace("__GRID_CSS__", GRID_CSS)
+        html = (PAGE.replace("__THEME_BOOT__", theme_boot()).replace("__BASE_CSS__", base_css()).replace("__GRID_CSS__", GRID_CSS)
                 .replace("__THEME_JS__", THEME_TOGGLE_JS).replace("__THEME_BUTTON__", THEME_BUTTON)
                 .replace("__TOKEN__", self.token).replace("__DATA__", data))
         return html.encode("utf-8")
@@ -470,12 +471,14 @@ body{padding-bottom:170px}
 #out{display:none;margin:4px 0 12px}
 label.opt{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:6px;cursor:pointer}
 label.opt:hover{background:var(--sunken)}
+label.opt.cur{background:var(--leaf-soft);box-shadow:inset 0 0 0 2px var(--leaf)}
 label.opt.cur .tx{font-weight:700}
+.regchip{display:inline-block;padding:2px 10px;border-radius:6px;background:var(--leaf-soft);box-shadow:inset 0 0 0 2px var(--leaf);font-weight:700;color:var(--ink)}
 label.opt.chosen{background:var(--saffron-soft);box-shadow:inset 0 0 0 1.5px var(--saffron)}
 td.cancel{position:relative;padding:0;width:104px;min-width:104px}
 .cbtn{position:absolute;inset:0;display:block;cursor:pointer}
 .cbtn span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:4px;text-align:center;
-  color:var(--muted);font-size:13px;font-weight:700}
+  color:var(--muted);font-size:0.812rem;font-weight:700}
 .cbtn:hover span{background:var(--sunken)}
 tr.res .cbtn input:checked+span{background:var(--brick-soft);color:var(--brick)}
 .cbtn input:focus-visible+span{outline:3px solid var(--tile);outline-offset:-3px}
@@ -489,26 +492,26 @@ tr.res .cbtn input:checked+span{background:var(--brick-soft);color:var(--brick)}
 .meter.short #mSpend{background:var(--brick)}
 #nums{display:flex;flex-wrap:wrap;gap:4px 28px;margin:8px 0 0;padding:0}
 #nums div{display:flex;flex-direction:column;line-height:1.35}
-#nums dt{font-size:12px;color:var(--muted)}
-#nums dd{margin:0;font-weight:700;font-size:18px;direction:ltr;unicode-bidi:isolate;text-align:right}
+#nums dt{font-size:0.75rem;color:var(--muted)}
+#nums dd{margin:0;font-weight:700;font-size:1.125rem;direction:ltr;unicode-bidi:isolate;text-align:right}
 .bad{color:var(--brick)}.good{color:var(--leaf)}
 .pay{display:flex;align-items:center;gap:8px}
 .pay[hidden]{display:none}
 #paytoggle{display:none}
-.pay label{color:var(--muted);font-size:13px}
+.pay label{color:var(--muted);font-size:0.812rem}
 .pay input{width:124px;text-align:left;direction:ltr}
 .pay.need input{border-color:var(--brick)}
-.pay .unit{color:var(--muted);font-size:13px}
+.pay .unit{color:var(--muted);font-size:0.812rem}
 .acts{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .chip{background:var(--saffron-soft);color:var(--ink);border:1px solid var(--saffron);border-radius:99px;padding:4px 14px;
   font-weight:700;cursor:pointer}
 .chip[hidden]{display:none}
 #chg{position:absolute;bottom:100%;inset-inline-end:clamp(12px,2.2vw,32px);margin:0;padding:10px 30px 10px 16px;min-width:320px;
   max-height:260px;overflow:auto;background:var(--surface);border:1px solid var(--line);border-bottom:0;border-radius:12px 12px 0 0;
-  font-size:14px}
+  font-size:0.875rem}
 #chg[hidden]{display:none}
 @media (max-width:640px){.pay input{width:100px}.pay:not(.open):not(.need){display:none}#paytoggle{display:inline-block}
-  .dockin{gap:8px 16px;padding-top:10px;padding-bottom:10px}#nums dd{font-size:16px}.acts{width:100%}.acts .btn{padding:6px 12px;font-size:13px}.acts #go{order:-1;flex:1 1 150px;font-size:15px;padding:9px 14px}}
+  .dockin{gap:8px 16px;padding-top:10px;padding-bottom:10px}#nums dd{font-size:1rem}.acts{width:100%}.acts .btn{padding:6px 12px;font-size:0.812rem}.acts #go{order:-1;flex:1 1 150px;font-size:0.938rem;padding:9px 14px}}
 </style></head><body>
 <div class="wrap">
 <header class="top">
@@ -518,7 +521,11 @@ tr.res .cbtn input:checked+span{background:var(--brick-soft);color:var(--brick)}
     __THEME_BUTTON__
   </div>
 </header>
-<div id="out" role="status" aria-live="polite"></div>
+<div id="out" role="status" aria-live="polite">
+  <pre id="outText"></pre>
+  <div id="outBar" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><i></i></div>
+  <details id="outMore" hidden><summary>مراحل</summary><pre id="outLog"></pre></details>
+</div>
 <nav id="tabs" role="tablist" aria-label="وعده‌ها"></nav>
 <main id="meals"></main>
 </div>
@@ -568,7 +575,11 @@ function buildRow(meal, day, selves, tb){
   tr.appendChild(dayTd); tb.appendChild(tr);
   var span = selves.length + 1, td;
   if(!day.active){ tr.className = "off"; td = h("td","msg","—"); td.colSpan = span; tr.appendChild(td); return; }
-  if(day.locked){ td = h("td","msg", day.reserved ? ("قفل‌شده · " + (day.curFood||"")) : "قفل‌شده"); td.colSpan = span; tr.appendChild(td); return; }
+  if(day.locked){
+    td = h("td","msg","قفل‌شده"); td.colSpan = span;
+    if(day.reserved){ td.appendChild(document.createTextNode(" · ")); td.appendChild(h("span","regchip",day.curFood||"")); }
+    tr.appendChild(td); return;
+  }
 
   var name = meal.key + "|" + day.date, info = {meal: meal, day: day, name: name, initial: day.reserved ? "cur" : "none", prices: {}, labels: {}, tr: tr};
   var hasCur = false;
@@ -683,7 +694,7 @@ function refresh(){
   var nums = $("nums"); nums.innerHTML = "";
   function item(label, val, cls){ var d = h("div"), dt = h("dt","",label), dd = h("dd","num " + (cls||""),val); d.appendChild(dt); d.appendChild(dd); nums.appendChild(d); }
   item("موجودی", fmt(credit), "");
-  item("تغییر", sgn(c.delta), "");
+  item("تغییر", sgn(-c.delta), "");
   item("پس از ثبت", (after<0 ? "\u2212" : "") + fmt(after), after < 0 ? "bad" : "good");
   if(short > 0) item("کمبود", fmt(short), "bad");
   DATA.meals.forEach(function(m, i){
@@ -707,18 +718,22 @@ function api(method, path, body, cb){
   x.send(body ? JSON.stringify(body) : null);
 }
 
-function bar(pct){
-  var p = h("div", "progress" + (pct < 0 ? " ind" : "")), i = h("i");
-  p.setAttribute("role","progressbar"); p.setAttribute("aria-valuemin","0"); p.setAttribute("aria-valuemax","100");
-  if(pct >= 0){ i.style.width = Math.round(pct) + "%"; p.setAttribute("aria-valuenow", String(Math.round(pct))); }
-  p.appendChild(i); return p;
+function setBar(el, pct){      // یک عنصر ثابت؛ فقط حالتش عوض می‌شود تا انیمیشن با هر به‌روزرسانی از اول شروع نشود
+  if(pct === undefined || pct === null){ el.hidden = true; return; }
+  el.hidden = false;
+  var i = el.firstChild;
+  if(pct < 0){ if(el.className.indexOf("ind") < 0) el.className = "progress ind"; i.style.width = ""; el.removeAttribute("aria-valuenow"); }
+  else { if(el.className.indexOf("ind") >= 0) el.className = "progress"; i.style.width = Math.round(pct) + "%"; el.setAttribute("aria-valuenow", String(Math.round(pct))); }
 }
 function show(kind, text, pct, details){
-  var o = $("out"); o.className = "alert " + kind; o.style.display = "block"; o.innerHTML = "";
-  o.appendChild(h("pre","",text));
-  if(pct !== undefined && pct !== null) o.appendChild(bar(pct));
-  if(details){ var d = h("details"); d.appendChild(h("summary","","مراحل")); d.appendChild(h("pre","",details)); o.appendChild(d); }
-  if(o.scrollIntoView) o.scrollIntoView({block:"nearest"});
+  var o = $("out"), cls = "alert " + kind, first = o.style.display !== "block";
+  if(o.className !== cls) o.className = cls;
+  o.style.display = "block";
+  var t = $("outText"); if(t.textContent !== text) t.textContent = text;
+  setBar($("outBar"), pct);
+  var m = $("outMore");
+  if(details){ m.hidden = false; var l = $("outLog"); if(l.textContent !== details) l.textContent = details; } else m.hidden = true;
+  if(first && o.scrollIntoView) o.scrollIntoView({block:"nearest"});
 }
 function hideOut(){ $("out").style.display = "none"; }
 function mealTitle(key){ for(var i=0;i<DATA.meals.length;i++) if(DATA.meals[i].key===key) return DATA.meals[i].title; return key; }
@@ -786,14 +801,14 @@ function handleStatus(j){
 
 $("go").onclick = function(){
   var c = calc();
-  if(!confirm("ثبت این تغییرات؟\n\n" + c.list.join("\n") + "\n\nجمع تغییر: " + sgn(c.delta) + " ریال")) return;
+  if(!confirm("ثبت این تغییرات؟\n\n" + c.list.join("\n") + "\n\nجمع تغییر موجودی: " + sgn(-c.delta) + " ریال")) return;
   var sels = rows.map(function(r){ return {meal: r.meal.key, date: r.day.date, value: current(r)}; });
   setBusy(true);
   api("POST", "/api/submit", {selections: sels}, function(j){
     if(j.state === "started"){ show("info", "شروع شد ...", -1); startPoll(); }
     else if(j.state === "insufficient"){
       DATA.credit = j.credit; lastShort = j.shortfall; refresh();
-      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در pending.json ذخیره شد.");
+      show("info", "موجودی کافی نیست؛ کمبود: " + fmt(j.shortfall) + " ریال.\nانتخاب‌ها در " + (j.pendingFile || "pending.json") + " ذخیره شد.");
       if(j.canPay){
         $("payamt").value = fmt(Math.max(10000, Math.ceil(j.shortfall / 1000) * 1000));
         $("payrow").className = "pay need"; $("payamt").focus();

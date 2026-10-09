@@ -19,9 +19,9 @@ from typing import Callable, Optional
 
 from bs4 import BeautifulSoup
 
-from food_menu import RESERVATION_URL, WEEK_BUTTONS, DayEntry, Meal, WeekMenu, _form_payload, _post, parse_page
+from config import cfg
+from food_menu import WEEK_BUTTONS, DayEntry, Meal, WeekMenu, _form_payload, _post, parse_page
 
-PENDING_FILE = "pending.json"
 
 
 # ----------------------------------------------------------------- مدل
@@ -116,22 +116,22 @@ def _open_week(session, url: str, dates: set) -> str:
     raise LookupError("تاریخ‌های انتخاب‌شده در هفته‌ی جاری و هفته‌ی بعد پیدا نشدند")
 
 
-def read_credit(session, url: str = RESERVATION_URL) -> Optional[int]:
+def read_credit(session, url: Optional[str] = None) -> Optional[int]:
     """«اعتبار شما» را از صفحه‌ی رزرو می‌خواند (برای پایش پرداخت)."""
-    r = session.get(url)
+    r = session.get(url or cfg.reservation_url)
     r.raise_for_status()
     if "txtUsernamePlain" in r.text:
         raise PermissionError("session لاگین نیست یا منقضی شده")
     return parse_page(r.text).credit
 
 
-def open_week_state(session, choices: list[Choice], url: str = RESERVATION_URL) -> tuple[WeekMenu, str]:
+def open_week_state(session, choices: list[Choice], url: Optional[str] = None) -> tuple[WeekMenu, str]:
     """صفحه‌ی هفته‌ی شامل این انتخاب‌ها را یک بار باز می‌کند؛ (وضعیت، html) برمی‌گرداند. html را می‌شود به submit داد."""
-    html = _open_week(session, url, {c.date for c in choices})
+    html = _open_week(session, url or cfg.reservation_url, {c.date for c in choices})
     return parse_page(html), html
 
 
-def current_state(session, choices: list[Choice], url: str = RESERVATION_URL) -> WeekMenu:
+def current_state(session, choices: list[Choice], url: Optional[str] = None) -> WeekMenu:
     """وضعیت فعلی صفحه (اعتبار و رزروها) برای هفته‌ی شامل این انتخاب‌ها."""
     return open_week_state(session, choices, url)[0]
 
@@ -154,8 +154,9 @@ def _apply_row(session, url, html, ticks, ch, say):
             html = _step(session, url, html, ticks, __EVENTTARGET=f["self"], __EVENTARGUMENT="", **{f["self"]: ch.self_id})
             day = find_day(parse_page(html), ch.meal, ch.date)
         if not (day and day.selected_self and day.selected_self.id == ch.self_id):
-            say(f"{tag} ✗ سلف «{ch.self_name}» انتخاب نشد")
-            return html, f"سلف «{ch.self_name}» انتخاب نشد", None
+            now = day.selected_self.name if day and day.selected_self else "؟"
+            say(f"{tag} ✗ سلف «{ch.self_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد")
+            return html, f"سلف «{ch.self_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد", None
         say(f"{tag} ← ۱) سلف «{ch.self_name}» ✓")
 
         if not any(x.id == ch.food_id for x in day.selected_self.foods):
@@ -165,8 +166,9 @@ def _apply_row(session, url, html, ticks, ch, say):
             html = _step(session, url, html, ticks, __EVENTTARGET=f["food"], __EVENTARGUMENT="", **{f["food"]: ch.food_id})
             day = find_day(parse_page(html), ch.meal, ch.date)
         if not (day and day.selected_food and day.selected_food.id == ch.food_id):
-            say(f"{tag} ✗ غذای «{ch.food_name}» انتخاب نشد")
-            return html, f"غذای «{ch.food_name}» انتخاب نشد", None
+            now = day.selected_food.name if day and day.selected_food else "؟"
+            say(f"{tag} ✗ غذای «{ch.food_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد")
+            return html, f"غذای «{ch.food_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد", None
         say(f"{tag} ← ۲) غذای «{ch.food_name}» ✓")
         ticks[f["chk"]] = True
         say(f"{tag} ← ۳) تیک رزرو روشن شد ✓")
@@ -174,6 +176,25 @@ def _apply_row(session, url, html, ticks, ch, say):
         ticks[f["chk"]] = False
         say(f"{tag} ← تیک رزرو خاموش شد (لغو رزرو) ✓")
     return html, None, f["chk"]
+
+
+def describe_state(day: Optional[DayEntry]) -> str:
+    """آنچه سامانه همین الان برای این روز/وعده ثبت کرده است (برای پیام‌های خطا)."""
+    if day is None:
+        return "این روز در صفحه دیده نشد"
+    if not day.reserved:
+        return "رزرو نشده"
+    sv, fd = day.selected_self, day.selected_food
+    txt = "رزرو شده"
+    if sv and fd:
+        txt += f": {sv.name} / {fd.name}"
+    if day.amount:
+        txt += f" ({day.amount:,} ریال)"
+    return txt
+
+
+def describe_want(ch: Choice) -> str:
+    return "لغو رزرو" if not ch.reserve else f"{ch.self_name} / {ch.food_name} ({ch.price:,} ریال)"
 
 
 def _row_ok(menu: WeekMenu, ch: Choice) -> bool:
@@ -185,7 +206,7 @@ def _row_ok(menu: WeekMenu, ch: Choice) -> bool:
                 and d.selected_self.id == ch.self_id and d.selected_food.id == ch.food_id)
 
 
-def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: Optional[Callable[[str], None]] = None,
+def submit(session, choices: list[Choice], url: Optional[str] = None, on_step: Optional[Callable[[str], None]] = None,
            html: Optional[str] = None) -> list[dict]:
     """
     ثبت انتخاب‌ها روی سایت، وعده به وعده و مرحله به مرحله:
@@ -199,6 +220,7 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
     دقیقاً همان وضعیت خواسته‌شده را نشان بدهد.
     """
     say = on_step or (lambda _m: None)
+    url = url or cfg.reservation_url
     if html is None:
         html = _open_week(session, url, {c.date for c in choices})
     before = parse_page(html)        # وضعیت و اعتبار پیش از ثبت (برای بررسی نهایی)
@@ -252,9 +274,9 @@ def submit(session, choices: list[Choice], url: str = RESERVATION_URL, on_step: 
         for ch, _chk in applied:  # راستی‌آزمایی از روی صفحه‌ی برگشتی
             d = find_day(after, ch.meal, ch.date)
             ok = bool(d) and d.reserved == ch.reserve and _row_ok(after, ch)
-            say(f"  {ch.weekday} {ch.date} " + ("✓ ثبت شد" if ok else "✗ بعد از ذخیره با خواسته‌ی تو یکی نیست"))
+            say(f"  {ch.weekday} {ch.date} " + ("✓ ثبت شد" if ok else f"✗ خواسته: {describe_want(ch)} ← سامانه ثبت کرده: {describe_state(d)}"))
             if not ok:
-                problems.append(f"{ch.weekday} {ch.date}: بعد از ذخیره، وضعیت با خواسته‌ی تو یکی نیست")
+                problems.append(f"{ch.weekday} {ch.date}: خواسته‌ی تو «{describe_want(ch)}»؛ سامانه ثبت کرده «{describe_state(d)}»")
         if after.message:
             say(f"  پیام سایت: {after.message}")
         results.append({"meal": meal_key, "ok": not problems, "message": after.message, "problems": problems,
@@ -284,9 +306,12 @@ def _final_check(session, url: str, before: WeekMenu, verified: list[Choice], sa
     for ch in verified:
         d = find_day(final, ch.meal, ch.date)
         ok = d is not None and d.reserved == ch.reserve and _row_ok(final, ch)
-        say(f"  {ch.weekday} {ch.date} · {ch.meal_title}: " + ("✓ تأیید شد" if ok else "✗ با سایت یکی نیست"))
+        say(f"  {ch.weekday} {ch.date} · {ch.meal_title}: " + ("✓ تأیید شد" if ok else f"✗ سامانه ثبت کرده: {describe_state(d)}"))
         if not ok:
-            problems.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): در سایت وضعیت دیگری دیده شد")
+            problems.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): خواسته‌ی تو «{describe_want(ch)}»؛ سامانه ثبت کرده «{describe_state(d)}»")
+        elif ch.reserve and d.amount and ch.price and d.amount != ch.price:   # غذا درست است ولی مبلغ ثبت‌شده فرق دارد
+            warnings.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): مبلغ ثبت‌شده در سامانه {d.amount:,} ریال است (قیمت غذا {ch.price:,})")
+            say(f"  ؟ {warnings[-1]}")
     credit = final.credit
     try:
         expected = (before.credit or 0) - price_delta(before, verified)
@@ -302,20 +327,21 @@ def _final_check(session, url: str, before: WeekMenu, verified: list[Choice], sa
 
 
 # ------------------------------------------------------ ذخیره‌ی انتخاب‌ها (موجودی کم)
-def save_pending(choices: list[Choice], path: str = PENDING_FILE) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+def save_pending(choices: list[Choice], path: Optional[str] = None) -> None:
+    with open(path or cfg.pending_file, "w", encoding="utf-8") as f:
         json.dump([asdict(c) for c in choices], f, ensure_ascii=False, indent=2)
 
 
-def load_pending(path: str = PENDING_FILE) -> list[Choice]:
+def load_pending(path: Optional[str] = None) -> list[Choice]:
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path or cfg.pending_file, encoding="utf-8") as f:
             return [Choice(**c) for c in json.load(f)]
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 
-def clear_pending(path: str = PENDING_FILE) -> None:
+def clear_pending(path: Optional[str] = None) -> None:
     import os
+    path = path or cfg.pending_file
     if os.path.exists(path):
         os.remove(path)

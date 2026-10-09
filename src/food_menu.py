@@ -10,6 +10,8 @@ food_menu.py - استخراج برنامه غذایی از Reservation.aspx (ف�
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -20,18 +22,21 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
-from ui import BASE_CSS, GRID_CSS, THEME_BOOT, THEME_BUTTON, THEME_TOGGLE_JS
+from config import cfg
+from ui import GRID_CSS, THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
 
-RESERVATION_URL = "https://jeton.yazd.ac.ir/Reservation/Reservation.aspx"
+logger = logging.getLogger(__name__)
 WEEK_BUTTONS = {"next": "imgbtnNextWeek"}  # "current" = همان GET اولیه
 TABLE_ID_RE = re.compile(r"^cphMain_grdReservation(\w+)$")
 FOOD_RE = re.compile(r"^(?P<name>.*?)\s+(?P<price>[\d,٬]+)\s*ریال\s*$")
+DEFAULT_TRANSPORT = None  # فقط برای تست: httpx.MockTransport
 PLACEHOLDER = "-1"  # روزهای غیرفعال (جمعه و ...)
 
 
 # فایل منو: سربرگ هر وعده (بدون JS همه‌ی وعده‌ها پشت‌سرهم دیده می‌شوند)
 _MENU_CSS = """
-.f{padding:3px 8px}.f.cur{font-weight:700}
+.f{padding:3px 8px;border-radius:6px}.f.cur{font-weight:700}
+.f.reg{box-shadow:inset 0 0 0 2px var(--leaf);background:var(--leaf-soft)}
 .alert{margin:6px 0 12px}
 .js .panel h2{display:none}
 @media print{#tabs,#theme{display:none}.panel{display:block !important}.js .panel h2{display:block}body{background:#fff}}
@@ -147,8 +152,8 @@ class WeekMenu:
         out = [
             '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">',
             '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">',
-            f"<title>برنامه غذایی {e(self.week_range or '')}</title>", THEME_BOOT,
-            f"<style>{BASE_CSS}{GRID_CSS}{_MENU_CSS}</style></head><body><div class=\"wrap\">",
+            f"<title>برنامه غذایی {e(self.week_range or '')}</title>", theme_boot(),
+            f"<style>{base_css()}{GRID_CSS}{_MENU_CSS}</style></head><body><div class=\"wrap\">",
             f'<header class="top"><div><span class="eyebrow">برنامه غذایی</span><h1><bdi>{e(self.week_range or "")}</bdi></h1></div>'
             f'<div class="tools">{THEME_BUTTON}</div></header>',
         ]
@@ -181,7 +186,7 @@ class WeekMenu:
                             cells.append('<td class="cell empty">·</td>')
                             continue
                         foods = "".join(
-                            f'<div class="f{" cur" if f.selected else ""}">- {e(f.name)}'
+                            f'<div class="f{" cur" if f.selected else ""}{" reg" if d.reserved and sv.selected and f.selected else ""}">- {e(f.name)}'
                             + (f' <span class="pr num">{f.price:,}</span>' if f.price else "")
                             + ('<span class="tick">✓</span>' if f.selected else "") + "</div>"
                             for f in sv.foods
@@ -285,27 +290,30 @@ def _post(session, url: str, payload: dict, **fields) -> str:
     return r.text
 
 
-def _clone_session(session):
-    """هر thread یک session مستقل (با همان کوکی‌ها) دارد؛ requests.Session کاملاً thread-safe نیست."""
-    s = requests.Session()
-    s.headers.update(session.headers)
-    s.cookies.update(session.cookies)
-    return s
-
-
-def fetch_menu(session, week: str = "current", all_selves: bool = True, url: str = RESERVATION_URL,
-               on_progress=None, threaded: bool = True) -> WeekMenu:
+def fetch_menu(session, week: str = "current", all_selves: bool = True, url: Optional[str] = None,
+               on_progress=None, method: Optional[str] = None, concurrency: Optional[int] = None,
+               max_threads: Optional[int] = None, transport=None) -> WeekMenu:
     """
     session     : requests.Session لاگین‌شده
     week        : "current" یا "next"
     all_selves  : غذاهای همه‌ی سلف‌ها (پیش‌فرض True). ردیف‌های قفل‌شده (گذشته/رزرو قطعی)
                   فقط همان غذای رزروشده را دارند، چون سایت اجازه‌ی تغییر سلف در آن‌ها را نمی‌دهد.
     on_progress : تابع اختیاری f(انجام‌شده, کل) برای نمایش پیشرفت
-    threaded    : برای هر روز هفته یک thread؛ thread روزِ غیرفعال (یا روزی که حین کار غیرفعال شود) همان‌جا تمام می‌شود
+    method      : روش دریافت (پیش‌فرض از config.ini → [fetch] method):
+                  "threads"    برای هر وعده در هر روز یک thread؛ همه‌ی منو یک‌جا دریافت می‌شود
+                  "async"      asyncio + httpx با حداکثر concurrency درخواست همزمان
+                  "sequential" پشت‌سرهم
+    max_threads : برای threads؛ 0 = به تعداد (وعده × روز) thread
+    transport   : فقط برای تست (httpx.MockTransport)
+    برای روزِ غیرفعال (یا روزی که حین کار غیرفعال شود) درخواستی فرستاده نمی‌شود.
     اگر برنامه‌ی هفته‌ی بعد هنوز ثبت نشده باشد، menu.has_food برابر False است.
     """
     if week not in ("current", "next"):
         raise ValueError("week must be 'current' or 'next'")
+    url = url or cfg.reservation_url
+    method = method or cfg.fetch_method
+    if method not in ("threads", "async", "sequential"):
+        raise ValueError("method must be threads | async | sequential")
 
     r = session.get(url)
     r.raise_for_status()
@@ -335,40 +343,146 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: str
 
     total = sum(map(len, jobs_by_date.values()))
     done = 0
-    lock = threading.Lock()
 
-    def advance(n: int) -> None:
+    def advance(n: int = 1) -> None:
         nonlocal done
-        with lock:
-            done += n
-            if on_progress:
-                on_progress(done, total)
+        done += n
+        if on_progress:
+            on_progress(done, total)
 
-    def run_day(date: str) -> None:
-        """thread همین روز. اگر روز غیرفعال باشد (یا حین کار غیرفعال شود)، همین‌جا تمام می‌شود."""
-        jobs = jobs_by_date[date]
-        if not jobs:
-            return
-        sess = _clone_session(session) if threaded else session
-        for i, (meal, day, target, s) in enumerate(jobs):
-            page = parse_page(_post(sess, url, payload, __EVENTTARGET=target, __EVENTARGUMENT="", **{target: s.id}))
-            d2 = next((d for m in page.meals if m.key == meal.key for d in m.days if d.date == day.date), None)
-            if d2 is None or not d2.active:  # روز در پاسخ سایت غیرفعال است؛ بقیه‌ی کارهای این روز لغو می‌شود
-                advance(len(jobs) - i)
-                return
-            got = next((x for x in d2.selves if x.id == s.id and x.selected), None)
-            if got:
-                s.foods = got.foods
-            advance(1)
-
-    if threaded and len(dates) > 1:
-        with ThreadPoolExecutor(max_workers=len(dates)) as ex:  # برای هر روز یک thread
-            for f in [ex.submit(run_day, dt) for dt in dates]:
-                f.result()  # خطای thread را بالا می‌آورد
+    if total == 0:
+        return menu
+    if method == "async" and total > 1 and _can_async():
+        asyncio.run(_run_jobs_async(session, url, payload, jobs_by_date, advance,
+                                    concurrency or cfg.fetch_concurrency, transport or DEFAULT_TRANSPORT))
+    elif method in ("threads", "async") and total > 1:   # async بدون httpx هم به threads برمی‌گردد
+        _run_jobs_threads(session, url, payload, jobs_by_date, advance,
+                          cfg.fetch_max_threads if max_threads is None else max_threads)
     else:
-        for dt in dates:
-            run_day(dt)
+        _run_jobs_sync(session, url, payload, jobs_by_date, advance)
     return menu
+
+
+def _clone_session(session):
+    """هر thread یک session مستقل (با همان کوکی‌ها) دارد؛ requests.Session کاملاً thread-safe نیست."""
+    s = requests.Session()
+    s.headers.update(session.headers)
+    s.cookies.update(session.cookies)
+    return s
+
+
+def _run_jobs_threads(session, url, payload, jobs_by_date, advance, max_threads: int = 0) -> None:
+    """
+    برای هر «وعده در هر روز» یک thread؛ همه با هم شروع می‌کنند تا تمام منو یک‌جا دریافت شود.
+    هر thread غذای سلف‌های دیگرِ همان وعده/روز را می‌گیرد. اگر روزی غیرفعال دیده شود، thread‌های همان روز زودتر تمام می‌شوند.
+    """
+    cells: dict = {}
+    for date, jobs in jobs_by_date.items():
+        for job in jobs:
+            cells.setdefault((job[0].key, date), []).append(job)
+    if not cells:
+        return
+    lock, abort, dead = threading.Lock(), threading.Event(), set()
+
+    def safe_advance(n: int = 1) -> None:
+        with lock:
+            advance(n)
+
+    def run_cell(date: str, jobs: list) -> None:
+        sess = _clone_session(session)
+        try:
+            for i, (meal, day, target, s) in enumerate(jobs):
+                if abort.is_set():
+                    return
+                if date in dead:
+                    return safe_advance(len(jobs) - i)
+                html = _post(sess, url, payload, __EVENTTARGET=target, __EVENTARGUMENT="", **{target: s.id})
+                if not _apply_result(date, meal, day, s, html):
+                    dead.add(date)
+                    return safe_advance(len(jobs) - i)
+                safe_advance()
+        except BaseException:
+            abort.set()
+            raise
+
+    workers = min(max_threads or len(cells), len(cells))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for f in [ex.submit(run_cell, key[1], jobs) for key, jobs in cells.items()]:
+            f.result()  # خطای thread را بالا می‌آورد
+
+
+def _apply_result(date: str, meal, day, s, html: str) -> bool:
+    """پاسخِ postback را در سلف s می‌گذارد. False یعنی روز در پاسخ سایت غیرفعال شده است."""
+    page = parse_page(html)
+    d2 = next((d for m in page.meals if m.key == meal.key for d in m.days if d.date == day.date), None)
+    if d2 is None or not d2.active:
+        return False
+    got = next((x for x in d2.selves if x.id == s.id and x.selected), None)
+    if got:
+        s.foods = got.foods
+    return True
+
+
+def _run_jobs_sync(session, url, payload, jobs_by_date, advance) -> None:
+    """روش sequential: درخواست‌ها پشت‌سرهم. روزِ غیرفعال، بقیه‌ی کارهایش لغو می‌شود."""
+    for date, jobs in jobs_by_date.items():
+        for i, (meal, day, target, s) in enumerate(jobs):
+            html = _post(session, url, payload, __EVENTTARGET=target, __EVENTARGUMENT="", **{target: s.id})
+            if not _apply_result(date, meal, day, s, html):
+                advance(len(jobs) - i)
+                break
+            advance()
+
+
+def _can_async() -> bool:
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        asyncio.get_running_loop()
+        return False  # داخل یک حلقه‌ی asyncio دیگر هستیم؛ مسیر thread امن‌تر است
+    except RuntimeError:
+        return True
+
+
+async def _run_jobs_async(session, url, payload, jobs_by_date, advance, concurrency, transport=None) -> None:
+    """
+    همه‌ی postbackها با asyncio و یک اتصال‌پولِ مشترک، همزمان (حداکثر `concurrency` تا در هر لحظه).
+    اگر روزی در یکی از پاسخ‌ها غیرفعال دیده شود، کارهای باقی‌مانده‌ی همان روز اصلاً فرستاده نمی‌شوند.
+    """
+    import httpx
+
+    jar = httpx.Cookies()
+    for c in session.cookies:
+        jar.set(c.name, c.value, domain=c.domain or "", path=c.path or "/")
+    headers = {k: v for k, v in session.headers.items() if k.lower() not in ("accept-encoding", "connection")}
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+    sem = asyncio.Semaphore(concurrency)
+    dead: set = set()
+
+    async with httpx.AsyncClient(cookies=jar, headers=headers, limits=limits, timeout=60.0, transport=transport,
+                                 follow_redirects=True) as client:
+        async def one(date, meal, day, target, s) -> None:
+            if date in dead:
+                return advance()
+            async with sem:
+                if date in dead:
+                    return advance()
+                r = await client.post(url, data={**payload, "__EVENTTARGET": target, "__EVENTARGUMENT": "", target: s.id})
+                r.raise_for_status()
+            if not _apply_result(date, meal, day, s, r.text):
+                dead.add(date)
+            advance()
+
+        tasks = [asyncio.ensure_future(one(date, *job)) for date, jobs in jobs_by_date.items() for job in jobs]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
 
 def fallback_notice(next_menu: WeekMenu, current_menu: WeekMenu) -> str:

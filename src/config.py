@@ -45,7 +45,7 @@ class Opt:
 
 OPTIONS: list[Opt] = [
     # ---------------------------------------------------------------- app
-    Opt("app", "ui", "terminal", "choice", "پرسش‌ها و کارها کجا انجام شود؟",
+    Opt("app", "ui", "web", "choice", "پرسش‌ها و کارها کجا انجام شود؟",
         ("terminal", "web"), {"terminal": "پرسش‌ها در ترمینال، انتخاب غذا در صفحه‌ی وب",
                               "web": "از همان اول Chrome باز می‌شود و همه‌چیز مرحله‌به‌مرحله در صفحه‌ی وب است"}, ask=True),
     Opt("app", "mode", "reserve", "choice", "کار پیش‌فرض هنگام شروع.",
@@ -66,14 +66,14 @@ OPTIONS: list[Opt] = [
         "نام کاربری. خالی = هر بار پرسیده می‌شود. (متغیر محیطی JETON_USER بر این مقدم است.)", ask=True),
     Opt("login", "password", "", "str",
         "رمز عبور. توصیه: خالی بگذار و از متغیر محیطی JETON_PASS استفاده کن؛ رمز داخل فایل به‌صورت متن ساده می‌ماند.",
-        secret=True),
+        secret=True, ask=True),
     Opt("login", "headless", True, "bool",
         "مرورگرِ ورود و کپچا مخفی باشد؟ (پنجره‌ی پرداخت همیشه دیده می‌شود.)", ask=True),
     Opt("login", "eager_load", True, "bool",
         "صفحه‌ی ورود را بدون انتظار برای همه‌ی منابع باز کن (سریع‌تر). اگر ورود مشکل پیدا کرد false کن."),
     Opt("login", "retries", 5, "int", "تعداد تلاش برای ورود (کپچا گاهی اشتباه تشخیص داده می‌شود).", lo=1, hi=20),
-    Opt("login", "captcha_dataset", r"..\dataset", "path",
-        "پوشه‌ی دیتاست تصاویر مرجع کپچا (زیرپوشه‌هایی به نام ارقام).", ask=True),
+    Opt("login", "captcha_dataset", r"dataset", "path",
+        "پوشه‌ی دیتاست تصاویر مرجع کپچا (زیرپوشه‌هایی به نام ارقام)."),
     Opt("login", "captcha_threshold", 0.4, "float", "کمترین شباهت (SSIM) برای پذیرفتن یک رقم کپچا.", lo=0, hi=1),
     Opt("login", "chromedriver_path", "", "path",
         "مسیر chromedriver دستی. خالی = Selenium خودش مدیریت می‌کند. فقط اگر دانلود خودکار 403 داد پر کن."),
@@ -84,7 +84,7 @@ OPTIONS: list[Opt] = [
         {"threads": "برای هر وعده در هر روز یک thread؛ همه‌ی منو یک‌جا دریافت می‌شود (پیش‌فرض)",
          "async": "asyncio با کتابخانه‌ی httpx و حداکثر fetch_concurrency درخواست همزمان",
          "sequential": "درخواست‌ها پشت‌سرهم (کند؛ برای اشکال‌یابی)"}, ask=True, attr="fetch_method"),
-    Opt("fetch", "max_threads", 0, "int",
+    Opt("fetch", "max_threads", 8, "int",
         "فقط برای روش threads: حداکثر تعداد thread همزمان. 0 = برای هر وعده در هر روز یک thread.",
         lo=0, hi=64, attr="fetch_max_threads"),
     Opt("fetch", "concurrency", 8, "int", "فقط برای روش async: حداکثر درخواست همزمان.", lo=1, hi=64,
@@ -92,11 +92,11 @@ OPTIONS: list[Opt] = [
     # ---------------------------------------------------------------- payment
     Opt("payment", "close_window", False, "bool",
         "بعد از نتیجه‌ی پرداخت، پنجره‌ی بانک خودکار بسته شود؟ false = باز می‌ماند.", ask=True, attr="close_payment_window"),
-    Opt("payment", "timeout_minutes", 30, "int",
+    Opt("payment", "timeout_minutes", 15, "int",
         "چند دقیقه منتظر برگشت از بانک بمانیم؟", lo=1, hi=240, attr="payment_timeout_minutes"),
     # ---------------------------------------------------------------- ui
     Opt("ui", "font", "2 Nazanin", "str",
-        "فونت صفحه‌ها (باید روی سیستم نصب باشد). در نبودش B Nazanin، Nazanin، Vazirmatn و فونت سیستم.", ask=True),
+        "فونت صفحه‌ها (باید روی سیستم نصب باشد). در نبودش B Nazanin، Nazanin، Vazirmatn و فونت سیستم."),
     Opt("ui", "theme", "system", "choice", "تم پیش‌فرض (دکمه‌ی تم داخل صفحه همچنان کار می‌کند).",
         ("system", "light", "dark"), {"system": "مطابق تنظیم سیستم", "light": "روشن", "dark": "تاریک"}, ask=True),
     # ---------------------------------------------------------------- advanced

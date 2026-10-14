@@ -131,6 +131,52 @@ def open_week_state(session, choices: list[Choice], url: Optional[str] = None) -
     return parse_page(html), html
 
 
+def read_account(session, url: Optional[str] = None) -> dict:
+    """حسابی که خودِ سایت الان واردشده نشان می‌دهد: {"name": ..., "id": ...} (بازخورد سایت، نه آنچه تایپ شده)."""
+    r = session.get(url or cfg.reservation_url)
+    r.raise_for_status()
+    if "txtUsernamePlain" in r.text:
+        raise PermissionError("session لاگین نیست یا منقضی شده")
+    m = parse_page(r.text)
+    return {"name": m.account_name, "id": m.account_id}
+
+
+def account_warning(typed: str, account: Optional[dict]) -> Optional[str]:
+    """
+    اگر نام کاربریِ واردشده عددی است و «شماره شناسایی» گزارش‌شده توسط سایت عدد دیگری است، هشدار می‌دهد؛
+    یعنی سایت احتمالاً هنوز نشستِ حسابِ قبلی را برگردانده است. (بدون خروج خودکار؛ تصمیم با خودِ کاربر است.)
+    """
+    acc_id = ((account or {}).get("id") or "").strip()
+    typed = (typed or "").strip()
+    if typed.isdigit() and acc_id.isdigit() and typed != acc_id:
+        return (f"سایت حساب با شماره {acc_id} را نشان می‌دهد، نه {typed} که وارد کردی. "
+                "احتمالاً نشست حساب قبلی هنوز روی سرور باز است؛ «خروج» را بزن و دوباره وارد شو.")
+    return None
+
+
+def logout_session(session, url: Optional[str] = None) -> tuple[bool, str]:
+    """
+    خروج از حساب با همان postbackِ دکمه‌ی «خروج» سایت (__doPostBack('ctl00$logout','')) و بعد بررسی:
+    صفحه‌ی رزرو را دوباره می‌خواند و اگر صفحه‌ی ورود برگشت، خروج تأیید می‌شود. خروجی: (تأیید شد؟، پیام).
+    """
+    url = url or cfg.reservation_url
+    try:
+        r = session.get(url)
+        r.raise_for_status()
+        if "txtUsernamePlain" in r.text:
+            return True, "از قبل خارج شده بود"
+        payload = _form_payload(BeautifulSoup(r.text, "lxml"))
+        out = session.post(url, data={**payload, "__EVENTTARGET": "ctl00$logout", "__EVENTARGUMENT": ""})
+        out.raise_for_status()
+        check = session.get(url)
+        check.raise_for_status()
+        if "txtUsernamePlain" in check.text:
+            return True, "از حساب خارج شدی"
+        return False, "سایت هنوز حساب را وارد شده نشان می‌دهد"
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
 def current_state(session, choices: list[Choice], url: Optional[str] = None) -> WeekMenu:
     """وضعیت فعلی صفحه (اعتبار و رزروها) برای هفته‌ی شامل این انتخاب‌ها."""
     return open_week_state(session, choices, url)[0]

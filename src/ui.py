@@ -75,7 +75,11 @@ button,input{font-family:inherit;font-size:inherit;color:inherit}
 .btn.secondary{background:var(--tile-soft);color:var(--tile);border-color:color-mix(in srgb,var(--tile) 35%,transparent)}
 .btn.ghost{background:transparent;color:var(--muted);border-color:var(--line)}
 .btn.ghost:hover:not(:disabled){color:var(--ink);border-color:var(--muted)}
+.btn.danger:hover:not(:disabled){color:var(--brick);border-color:var(--brick)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+.who{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border:1px solid var(--line);border-radius:99px;background:var(--surface);color:var(--muted);font-size:.875rem}
+.who{max-width:min(52vw,380px)}
+.who bdi{font-weight:700;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .icon{display:inline-grid;place-items:center;width:38px;height:38px;border-radius:var(--r);border:1px solid var(--line);
   background:transparent;color:var(--muted);cursor:pointer}
 .icon:hover{color:var(--ink);border-color:var(--muted)}

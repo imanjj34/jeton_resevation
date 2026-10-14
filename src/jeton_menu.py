@@ -24,7 +24,8 @@ import requests
 from config import ConfigError, apply_logging, cfg, ensure, save_option
 from food_menu import fallback_notice, fetch_menu, fetch_menu_with_fallback
 from payment import CALLBACK_MARK, parse_callback
-from reserve import clear_pending, current_state, load_pending, price_delta, submit, summary_lines
+from reserve import (account_warning, clear_pending, current_state, load_pending, logout_session, price_delta, submit,
+                     summary_lines)
 from web_app import AppServer
 from web_select import SelectionServer
 
@@ -227,6 +228,27 @@ def _page_alert(driver) -> str:
         "var e=document.getElementById('cphMain_alertBoxValue');return e?e.textContent:'';") or "").strip()
 
 
+def _set_cookies_cdp(driver, session: requests.Session) -> bool:
+    """
+    کوکی‌های ورود را با پروتکل DevTools مستقیم در مرورگر می‌گذارد، بدون این‌که اول هیچ صفحه‌ای از سایت باز شود؛
+    پس هیچ درخواستِ بی‌کوکی (که روی سرور یک نشست خالی می‌سازد) فرستاده نمی‌شود. اگر پشتیبانی نشد False.
+    """
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        for c in session.cookies:
+            params = {"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)}
+            if c.domain:
+                params["domain"] = c.domain.lstrip(".")
+            else:
+                params["url"] = cfg.base_url
+            res = driver.execute_cdp_cmd("Network.setCookie", params)
+            if isinstance(res, dict) and res.get("success") is False:
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def open_payment(session: requests.Session, amount: int, username: str, password: str) -> PaymentBrowser:
     """
     یک پنجره‌ی Chrome باز می‌کند (با همان کوکی‌های لاگین) و مثل کاربر جلو می‌رود:
@@ -238,9 +260,11 @@ def open_payment(session: requests.Session, amount: int, username: str, password
     _load_heavy()
     driver = _new_driver()
     try:
-        driver.get(cfg.base_url)
-        for c in session.cookies:
-            driver.add_cookie({"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)})
+        if not _set_cookies_cdp(driver, session):
+            # پشتیبان: برای add_cookie باید روی دامنه باشیم. فایل ایستا (نه صفحه‌ی aspx) باز می‌شود تا نشست تازه‌ی بی‌کوکی ساخته نشود
+            driver.get(cfg.base_url + "favicon.ico")
+            for c in session.cookies:
+                driver.add_cookie({"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)})
         driver.get(cfg.epay_url)
         if not driver.find_elements(By.ID, "cphMain_txtPaymentAmount"):
             # کوکی‌ها پذیرفته نشد؛ در همین پنجره لاگین می‌کنیم و کوکی‌های جدید را به session هم می‌دهیم
@@ -426,7 +450,7 @@ def mode_reserve(session, relogin, username: str, password: str, week: str, menu
         return
     # انتخاب در صفحه‌ی وب انجام می‌شود و بعد از «ثبت نهایی» روی سایت اعمال می‌شود
     SelectionServer(session, menu, relogin,
-                    pay_opener=lambda sess, amount: open_payment(sess, amount, username, password),
+                    pay_opener=lambda sess, amount: open_payment(sess, amount, username, password), username=username,
                     refetch=lambda sess, wk, on_progress: fetch_menu(sess, wk, all_selves=True, on_progress=on_progress),
                     week_key=week, close_pay_window=cfg.close_payment_window, exit_when_done=cfg.exit_after_success).run()
 
@@ -454,6 +478,13 @@ def mode_pending(session, relogin) -> None:
 MODE_KEYS = ["reserve", "file", "pending"]
 
 
+def _logout_if_configured(session) -> None:
+    """[app] logout_on_exit: بعد از پایان کار، نشستِ روی سرور هم بسته می‌شود (نه فقط برنامه). سرور وب خودش خارج می‌شود."""
+    if cfg.logout_on_exit and session is not None:
+        ok, msg = logout_session(session)
+        print("از حساب خارج شدی." if ok else f"خروج از حساب تأیید نشد: {msg}")
+
+
 def terminal_main() -> None:
     preload_heavy()  # همزمان با پرسش‌ها بارگذاری می‌شود
     print("=== سامانه‌ی تغذیه ===\n")
@@ -474,13 +505,20 @@ def terminal_main() -> None:
     session, menu, notice = prefetch.wait(week)  # فقط اگر ورود هنوز تمام نشده باشد منتظر می‌ماند
     if notice:
         print("\n" + notice)
+    if menu is not None and (menu.account_name or menu.account_id):   # بازخورد خودِ سایت
+        acct = {"name": menu.account_name, "id": menu.account_id}
+        print("حساب واردشده در سایت: " + " · ".join(x for x in acct.values() if x))
+        if account_warning(username, acct):
+            print("⚠ " + account_warning(username, acct))
     relogin = lambda: get_session(username, password)
     if mode == "reserve":
         mode_reserve(session, relogin, username, password, week, menu)
     elif mode == "file":
         mode_menu_file(session, week, *file_opts, menu=menu)
+        _logout_if_configured(session)
     else:
         mode_pending(session, relogin)
+        _logout_if_configured(session)
 
 
 def web_main() -> None:

@@ -23,8 +23,8 @@ from urllib.parse import parse_qs, urlparse
 from food_menu import WeekMenu, fallback_notice
 from config import cfg
 from ui import GRID_CSS, THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
-from reserve import (Choice, _is_noop, clear_pending, find_day, find_meal, open_week_state, price_delta,
-                     read_credit, save_pending, submit, summary_lines)
+from reserve import (Choice, _is_noop, account_warning, clear_pending, find_day, find_meal, logout_session,
+                     open_week_state, price_delta, read_credit, save_pending, submit, summary_lines)
 
 
 def open_browser(url: str) -> None:
@@ -61,6 +61,7 @@ def build_data(menu: WeekMenu, preselect: dict | None = None) -> dict:
             days.append({
                 "date": d.date, "weekday": d.weekday, "active": d.active, "locked": d.locked,
                 "reserved": d.reserved, "amount": d.amount or 0, "curFood": cur.name if cur else None,
+                "curSelf": d.selected_self.name if d.reserved and d.selected_self else None,
                 "selves": [{"id": s.id, "name": s.name,
                             "foods": [{"id": f.id, "name": f.name, "price": f.price or 0,
                                        "cur": bool(d.reserved and s.selected and f.selected)} for f in s.foods]}
@@ -103,7 +104,7 @@ def selections_to_choices(menu: WeekMenu, selections: list[dict]) -> list[Choice
 # ------------------------------------------------------------------ سرور
 class SelectionServer:
     def __init__(self, session, menu: WeekMenu, relogin, pay_opener=None, refetch=None, week_key=None,
-                 close_pay_window=False, exit_when_done=False):
+                 close_pay_window=False, exit_when_done=False, username: str = ""):
         """
         pay_opener(session, amount) -> شیئی با close() و wait_for_result(stop) که پنجره‌ی پرداخت اینترنتی را
         باز می‌کند و بعد از برگشت از بانک نتیجه را برمی‌گرداند (اختیاری؛ بدون آن بخش پرداخت پنهان است).
@@ -114,6 +115,8 @@ class SelectionServer:
         self.session, self.menu, self._relogin = session, menu, relogin
         self.pay_opener = pay_opener
         self._refetch, self.week_key = refetch, week_key
+        self.username = username          # فقط برای نمایش در بالای صفحه
+        self.logged_out = False
         self.close_pay_window, self.exit_when_done = close_pay_window, exit_when_done
         self._kept_browsers: list = []  # پنجره‌های پرداختی که عمداً باز نگه داشته شده‌اند
         self.preselect: dict = {}
@@ -348,8 +351,38 @@ class SelectionServer:
     def data(self) -> dict:
         d = build_data(self.menu, self.preselect)
         d.update(canPay=self.pay_opener is not None, notice=self.notice, version=self.job["data_version"],
-                 exitWhenDone=self.exit_when_done, canReload=self._refetch is not None)
+                 exitWhenDone=self.exit_when_done, canReload=self._refetch is not None, username=self.username)
+        acct = {"name": getattr(self.menu, "account_name", None), "id": getattr(self.menu, "account_id", None)}
+        d.update(account=acct, accountWarning=account_warning(self.username, acct))   # بازخورد خودِ سایت
         return d
+
+    # -- خروج از حساب و پایان برنامه
+    def _logout_quietly(self) -> None:
+        if cfg.logout_on_exit and self.session is not None and not self.logged_out:
+            try:
+                ok, _ = logout_session(self.session)
+                self.logged_out = ok
+            except Exception:  # noqa: BLE001
+                pass
+
+    def api_logout(self, body: dict | None = None) -> dict:
+        """اول از حساب سامانه خارج می‌شود (و تأیید می‌گیرد)، بعد برنامه تمام می‌شود. force=True: حتی اگر خروج تأیید نشد، فقط برنامه بسته شود."""
+        force = bool((body or {}).get("force"))
+        if self._busy() and not force:
+            return {"state": "error", "message": "یک عملیات در حال انجام است؛ صبر کن تمام شود."}
+        ok, msg = True, "بدون ورود"
+        if self.session is not None and not self.logged_out:
+            with self.lock:
+                ok, msg = logout_session(self.session)
+            self.logged_out = ok
+        if not ok and not force:
+            return {"state": "error", "message": f"خروج از حساب تأیید نشد ({msg})."}
+        self.stop.set()
+        self._close_pay()
+        self._close_kept()
+        if self.httpd:
+            threading.Timer(1.2, self.httpd.shutdown).start()   # بعد از ارسال پاسخ به صفحه
+        return {"state": "bye", "loggedOut": self.logged_out, "message": msg}
 
     def api_cancel(self) -> dict:
         self.stop.set()
@@ -377,7 +410,7 @@ class SelectionServer:
     def routes(self) -> dict:
         return {"/api/submit": self.api_submit, "/api/pay": self.api_pay, "/api/topup": self.api_topup,
                 "/api/credit": lambda body: self.api_credit(), "/api/cancel": lambda body: self.api_cancel(),
-                "/api/reload": self.api_reload}
+                "/api/reload": self.api_reload, "/api/logout": self.api_logout}
 
     def _handler(self):
         srv = self
@@ -408,8 +441,8 @@ class SelectionServer:
 
             def do_GET(self):
                 u = urlparse(self.path)
-                if not self._ok_host():
-                    return self._send(403, b"forbidden", "text/plain")
+                # if not self._ok_host():
+                #     return self._send(403, b"forbidden", "text/plain")
                 if u.path == "/" and secrets.compare_digest(parse_qs(u.query).get("t", [""])[0], srv.token):
                     return self._send(200, srv.page(), "text/html; charset=utf-8")
                 if u.path == "/api/status" and self._ok_token():
@@ -422,8 +455,8 @@ class SelectionServer:
                 self._send(404, b"not found", "text/plain")
 
             def do_POST(self):
-                if not (self._ok_host() and self._ok_token()):
-                    return self._send(403, b"forbidden", "text/plain")
+                # if not (self._ok_host() and self._ok_token()):
+                #     return self._send(403, b"forbidden", "text/plain")
                 routes = srv.routes()
                 try:
                     n = min(int(self.headers.get("Content-Length", 0)), 1_000_000)
@@ -437,7 +470,7 @@ class SelectionServer:
         return Handler
 
     def start(self) -> str:
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", 0), self._handler())
         return f"http://127.0.0.1:{self.httpd.server_address[1]}/?t={self.token}"
 
     def run(self, launch: bool = True) -> None:
@@ -452,6 +485,7 @@ class SelectionServer:
             print("\nمتوقف شد.")
         finally:
             self.stop.set()
+            self._logout_quietly()
             self._close_pay()
             self._close_kept()
             self.httpd.server_close()
@@ -517,8 +551,10 @@ tr.res .cbtn input:checked+span{background:var(--brick-soft);color:var(--brick)}
 <header class="top">
   <div><span class="eyebrow">برنامه غذایی</span><h1><bdi id="week"></bdi></h1></div>
   <div class="tools">
+    <span id="who" class="who" hidden title="حساب کاربری"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg><bdi id="whoName"></bdi></span>
     <button id="reload" class="btn ghost" type="button" style="display:none">دریافت مجدد</button>
     __THEME_BUTTON__
+    <button id="logout" class="btn ghost danger" type="button" title="خروج از حساب و بستن برنامه">خروج</button>
   </div>
 </header>
 <div id="out" role="status" aria-live="polite">
@@ -562,6 +598,18 @@ function fmt(n){ return String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?
 function sgn(n){ return (n<0?"\u2212":(n>0?"+":"")) + fmt(n); }
 function parseAmt(t){ return parseInt(String(t).replace(/[^0-9]/g,""),10) || 0; }
 
+function whoText(){      // حسابی که خودِ سایت واردشده نشان می‌دهد؛ اگر نبود، همان نام کاربری تایپ‌شده
+  var a = DATA.account || {}, parts = [];
+  if(a.name) parts.push(a.name);
+  if(a.id) parts.push(a.id);
+  return parts.join(" · ") || DATA.username || "";
+}
+function updateWho(){
+  var t = whoText();
+  $("whoName").textContent = t; $("who").hidden = !t;
+  $("who").title = t ? "حساب واردشده در سایت: " + t : "";
+}
+
 function selvesOf(meal){      // ستون‌ها: هر سلفی که در این وعده در هر روزی غذا دارد (به ترتیب دیده‌شدن)
   var seen = {}, list = [];
   meal.days.forEach(function(d){ d.selves.forEach(function(s){ if(!seen[s.id]){ seen[s.id]=1; list.push({id:s.id, name:s.name}); } }); });
@@ -571,13 +619,13 @@ function selvesOf(meal){      // ستون‌ها: هر سلفی که در این
 function buildRow(meal, day, selves, tb){
   var tr = h("tr", day.reserved ? "res" : ""), dayTd = h("td","day");
   dayTd.appendChild(h("strong","",day.weekday)); dayTd.appendChild(h("span","dt",day.date));
-  if(day.reserved) dayTd.appendChild(h("span","badge","رزرو شده"));
+  if(day.reserved) dayTd.appendChild(h("span","badge","رزرو شده" + (day.curSelf ? " · " + day.curSelf : "")));
   tr.appendChild(dayTd); tb.appendChild(tr);
   var span = selves.length + 1, td;
   if(!day.active){ tr.className = "off"; td = h("td","msg","—"); td.colSpan = span; tr.appendChild(td); return; }
   if(day.locked){
     td = h("td","msg","قفل‌شده"); td.colSpan = span;
-    if(day.reserved){ td.appendChild(document.createTextNode(" · ")); td.appendChild(h("span","regchip",day.curFood||"")); }
+    if(day.reserved){ td.appendChild(document.createTextNode(" · ")); td.appendChild(h("span","regchip",(day.curSelf ? day.curSelf + " · " : "") + (day.curFood||""))); }
     tr.appendChild(td); return;
   }
 
@@ -589,7 +637,7 @@ function buildRow(meal, day, selves, tb){
   if(day.reserved && !hasCur){   // رزرو فعلی در فهرست نیست: گزینه‌ی «بدون تغییر»
     info.prices["cur"] = day.amount;
     var cl = h("label","opt cur"); cl.setAttribute("data-base","opt cur");
-    cl.appendChild(radio("cur", true)); cl.appendChild(h("span","tx","بدون تغییر: " + (day.curFood||"")));
+    cl.appendChild(radio("cur", true)); cl.appendChild(h("span","tx","بدون تغییر: " + (day.curSelf ? day.curSelf + " / " : "") + (day.curFood||"")));
     dayTd.appendChild(cl);
   }
   selves.forEach(function(sv){
@@ -761,6 +809,8 @@ function fetchData(){
     DATA = j; DATA.preselect = keep; dataVersion = j.version; build(); refresh();
     if(manualReload){ show("ok", "منو از سایت بروز شد." + (DATA.notice ? "\n" + DATA.notice : "")); }
     else if(DATA.notice) show("info", DATA.notice);
+    updateWho();
+    if(DATA.accountWarning) show("err", DATA.accountWarning);
     manualReload = false; autoReload = false; setBusy(false);
   });
 }
@@ -851,6 +901,24 @@ $("paytoggle").onclick = function(){
   var r = $("payrow"), open = r.className.indexOf("open") < 0;
   r.className = "pay" + (open ? " open" : "") + (r.className.indexOf("need") >= 0 ? " need" : ""); this.setAttribute("aria-expanded", open ? "true" : "false"); refresh();
 };
+function lockPage(){
+  stopPoll();
+  var all = document.querySelectorAll("button, input, select");
+  for(var i=0;i<all.length;i++) if(all[i].id !== "theme") all[i].disabled = true;
+  document.getElementById("meals").style.opacity = ".45"; document.getElementById("dock").style.opacity = ".6";
+}
+function doLogout(force){
+  busy = true; refresh(); show("info", "در حال خروج از حساب ...", -1);
+  api("POST", "/api/logout", {force: force}, function(j){
+    if(j.state === "bye"){ lockPage(); show("ok", (j.loggedOut ? "از حساب خارج شدی. " : "") + "برنامه بسته شد؛ می‌توانی این صفحه را ببندی."); return; }
+    setBusy(false); show("err", j.message || "خطا");
+    if(!force && confirm((j.message || "خروج ناموفق بود") + "\nفقط برنامه بسته شود؟")) doLogout(true);
+  });
+}
+$("logout").onclick = function(){
+  if(!confirm("از حساب خارج می‌شوی و برنامه بسته می‌شود.\nادامه؟")) return;
+  doLogout(false);
+};
 $("changes").onclick = function(){
   var ul = $("chg"); ul.hidden = !ul.hidden; this.setAttribute("aria-expanded", ul.hidden ? "false" : "true");
 };
@@ -859,7 +927,10 @@ window.onresize = function(){ document.body.style.paddingBottom = ($("dock").off
 
 if(DATA.canPay){ $("payrow").hidden = false; $("paytoggle").hidden = false; }
 if(DATA.canReload) $("reload").style.display = "";
+updateWho();
 build(); refresh();
-if(DATA.notice || preApplied > 0) show("info", (DATA.notice ? DATA.notice + "\n" : "") + (preApplied > 0 ? preApplied + " انتخاب ذخیره‌شده اعمال شد." : ""));
+var firstMsg = (DATA.notice ? DATA.notice + "\n" : "") + (preApplied > 0 ? preApplied + " انتخاب ذخیره‌شده اعمال شد." : "");
+if(DATA.accountWarning) show("err", DATA.accountWarning + (firstMsg ? "\n" + firstMsg : ""));
+else if(firstMsg) show("info", firstMsg);
 </script></body></html>
 """

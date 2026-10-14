@@ -121,6 +121,8 @@ class WeekMenu:
     message: Optional[str]  # پیام سامانه (alertBox)، اگر باشد
     meals: list[Meal] = field(default_factory=list)
     credit: Optional[int] = None  # «اعتبار شما» (ریال)
+    account_name: Optional[str] = None  # نامی که سایت در هدر برای حسابِ واردشده نشان می‌دهد
+    account_id: Optional[str] = None    # «شماره شناسایی» همان حساب (بازخورد سایت)
 
     @property
     def has_food(self) -> bool:
@@ -128,7 +130,10 @@ class WeekMenu:
         return any(d.has_food for m in self.meals for d in m.days)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("account_name", None)   # مشخصات حساب داخل فایل خروجی نمی‌رود
+        d.pop("account_id", None)
+        return d
 
     def to_text(self) -> str:
         out = [f"هفته: {self.week_range or '?'}"]
@@ -173,7 +178,7 @@ class WeekMenu:
                 out.append(f'<section class="panel" id="panel_{mi}" data-title="{e(m.title)}"><h2>{e(m.title)}</h2>'
                            f'<div class="gridwrap"><table class="grid"><thead><tr><th class="dayh">روز</th>{head}</tr></thead><tbody>')
                 for d in m.days:
-                    badge = '<span class="badge">رزرو شده</span>' if d.reserved else ""
+                    badge = (f'<span class="badge">رزرو شده{" · " + e(d.selected_self.name) if d.selected_self else ""}</span>') if d.reserved else ""
                     day = f'<td class="day"><strong>{e(d.weekday)}</strong><span class="dt">{e(d.date)}</span>{badge}</td>'
                     cls = "res" if d.reserved else ("off" if not d.active else "")
                     if not d.active or not cols:
@@ -238,6 +243,11 @@ def _parse_row(tr) -> Optional[DayEntry]:
                             "food": food_sel.get("name") if food_sel else None})
 
 
+def _clean_text(el) -> Optional[str]:
+    t = " ".join(el.get_text(" ", strip=True).split()) if el else ""
+    return t or None
+
+
 def parse_page(html: str) -> WeekMenu:
     soup = BeautifulSoup(html, "lxml")
     week = soup.find(id="cphMain_lblWeekDate")
@@ -247,6 +257,8 @@ def parse_page(html: str) -> WeekMenu:
         week_range=" ".join(week.get_text().split()) if week else None,
         message=msg.get_text(strip=True) or None if msg else None,
         credit=_int(credit.get_text()) if credit else None,
+        account_name=_clean_text(soup.find(id="divUsername")),
+        account_id=_clean_text(soup.find(id="lblIdNumber")),
     )
     for table in soup.find_all("table", id=TABLE_ID_RE):
         li = table.find_parent("li")

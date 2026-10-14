@@ -17,7 +17,7 @@ from food_menu import fallback_notice
 from config import cfg
 from ui import THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
 from web_select import SelectionServer
-from reserve import Choice, load_pending
+from reserve import Choice, account_warning, load_pending, read_account
 
 MODES = ("reserve", "file", "pending")
 
@@ -47,6 +47,7 @@ class AppServer(SelectionServer):
         self._env = (env_user, env_pass) if env_user and env_pass else None
         self._dataset_ok, self._set_dataset = dataset_ok, set_dataset
         self.defaults = {"mode": default_mode, "week": default_week}
+        self.account, self.account_warning = None, None   # بازخورد خودِ سایت درباره‌ی حسابِ واردشده
         self.stage = "login"      # login (نیاز به اطلاعات) -> home (ورود شروع شده) -> select
         self.file_blob = None     # (بایت‌ها، content-type) آخرین فایل منو
         self.bg = {"login": "idle", "login_error": None, "prefetch": "idle", "progress": None, "week": None, "fallback": False}
@@ -57,7 +58,7 @@ class AppServer(SelectionServer):
 
     # -- وضعیت برای صفحه
     def status(self) -> dict:
-        return {**self.job, "stage": self.stage, "bg": self.bg, "env_user": self._env[0] if self._env else None,
+        return {**self.job, "stage": self.stage, "bg": self.bg, "user": self.username if self.session is not None else "", "account": self.account, "warning": self.account_warning, "env_user": self._env[0] if self._env else None,
                 "need_dataset": bool(self._dataset_ok and not self._dataset_ok()),
                 "has_pending": bool(load_pending()), "defaults": self.defaults}
 
@@ -94,6 +95,7 @@ class AppServer(SelectionServer):
         self._login_done.clear()
         self._pf_done.clear()
         self._login_error, self._pf_menus, self._pf_week = None, {}, None
+        self.account, self.account_warning = None, None
         self.bg.update(login="working", login_error=None, prefetch="idle", progress=None, week=None, fallback=False)
         self.stage = "home"
         threading.Thread(target=self._login_job, args=(user, pw), daemon=True).start()
@@ -130,6 +132,15 @@ class AppServer(SelectionServer):
             self._login_done.set()
             self._pf_done.set()
             return
+        self.username = user          # برای نمایش بالای صفحه
+        try:                           # حسابی که سایت واقعاً واردشده نشان می‌دهد
+            self.account = read_account(self.session)
+            self.account_warning = account_warning(user, self.account)
+            self._log("حساب سایت: " + " · ".join(x for x in (self.account.get("name"), self.account.get("id")) if x))
+            if self.account_warning:
+                self._log(self.account_warning)
+        except Exception:  # noqa: BLE001  (فقط نمایشی است؛ ورود را خراب نمی‌کند)
+            pass
         self.bg["login"] = "done"
         self._log("ورود موفق ✓")
         self._login_done.set()
@@ -292,7 +303,7 @@ h1{font-size:1.625rem;font-weight:700;line-height:1.3}
 .result{margin-top:14px}
 </style></head><body>
 <div class="shell">
-<header class="top"><h1>سامانه‌ی تغذیه</h1><div class="tools">__THEME_BUTTON__</div></header>
+<header class="top"><h1>سامانه‌ی تغذیه</h1><div class="tools"><span id="who" class="who" hidden title="حساب کاربری"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg><bdi id="whoName"></bdi></span>__THEME_BUTTON__<button id="logout" class="btn ghost danger" type="button" hidden title="خروج از حساب و بستن برنامه">خروج</button></div></header>
 <ol class="steps" id="steps"></ol>
 <div id="bg" class="alert info" role="status"><div id="bgText"></div><div id="bgBar" class="progress" hidden><i></i></div></div>
 <div id="err" class="alert err" role="alert"></div>
@@ -419,7 +430,12 @@ function banner(st){
 }
 
 function render(st){
-  showErr(st.error || (st.stage === "login" ? (st.bg || {}).login_error : null));
+  var a = st.account || {}, parts = [];
+  if(a.name) parts.push(a.name);
+  if(a.id) parts.push(a.id);
+  var who = parts.join(" · ") || st.user || "";
+  $("who").hidden = !who; $("logout").hidden = !who; if($("whoName").textContent !== who) $("whoName").textContent = who;
+  showErr(st.error || (st.stage === "login" ? (st.bg || {}).login_error : null) || st.warning);
   banner(st);
   if(st.stage === "select"){ location.reload(); return false; }
   var want = st.job === "working" ? "busy" : st.stage;
@@ -433,6 +449,20 @@ function render(st){
   }
   return true;
 }
+$("logout").onclick = function(){
+  if(!confirm("از حساب خارج می‌شوی و برنامه بسته می‌شود.\nادامه؟")) return;
+  go(false);
+  function go(force){
+    api("POST","/api/logout",{force: force},function(j){
+      if(j.state === "bye"){
+        if(timer){ clearInterval(timer); timer = null; }
+        $("view").innerHTML = ""; $("bg").style.display = "none"; showErr("");
+        var ok = h("div","alert ok"); ok.textContent = (j.loggedOut ? "از حساب خارج شدی. " : "") + "برنامه بسته شد؛ می‌توانی این صفحه را ببندی."; $("view").appendChild(ok);
+        $("logout").hidden = true;
+      } else { showErr(j.message || "خطا"); if(!force && confirm((j.message || "خروج ناموفق بود") + "\nفقط برنامه بسته شود؟")) go(true); }
+    });
+  }
+};
 function tick(){ api("GET","/api/status",null,function(st){ if(!render(st) && timer){ clearInterval(timer); timer = null; } }); }
 timer = setInterval(tick, 1000); tick();
 </script></body></html>

@@ -12,7 +12,6 @@ from urllib.parse import urljoin, urlparse
 import cv2
 import numpy as np
 import requests
-from skimage.metrics import structural_similarity as ssim
 
 BASE_URL = "https://jeton.yazd.ac.ir/"
 HOME_PATH = "/master/default.aspx"
@@ -20,6 +19,27 @@ CROP = [(9, 77, 34, 94), (9, 98, 34, 115), (9, 119, 34, 136), (9, 139, 34, 156)]
 THRESHOLD = 0.4
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 log = logging.getLogger("jeton_login")
+
+
+def ssim(x: np.ndarray, y: np.ndarray, win: int = 7, data_range: float = 255.0) -> float:
+    """SSIM با همان فرمول و پنجره‌ی ۷×۷ یکنواخت و کوواریانس نمونه‌ای scikit-image، فقط با numpy."""
+    if x.shape != y.shape or min(x.shape) < win:
+        raise ValueError("ابعاد تصاویر یکسان نیست یا از پنجره کوچک‌تر است")
+    x = x.astype(np.float64)
+    y = y.astype(np.float64)
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    np_ = win * win
+    cov_norm = np_ / (np_ - 1)
+
+    def mean(a: np.ndarray) -> np.ndarray:
+        return np.lib.stride_tricks.sliding_window_view(a, (win, win)).mean(axis=(2, 3))
+
+    ux, uy = mean(x), mean(y)
+    vx = cov_norm * (mean(x * x) - ux * ux)
+    vy = cov_norm * (mean(y * y) - uy * uy)
+    vxy = cov_norm * (mean(x * y) - ux * uy)
+    s = ((2 * ux * uy + c1) * (2 * vxy + c2)) / ((ux * ux + uy * uy + c1) * (vx + vy + c2))
+    return float(s.mean())
 
 
 class LoginError(RuntimeError):

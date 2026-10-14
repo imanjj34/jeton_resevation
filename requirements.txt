@@ -7,5 +7,4 @@ beautifulsoup4>=4.12   # خواندن صفحه‌های سایت
 lxml>=4.9              # پارسر سریع برای beautifulsoup4
 opencv-python>=4.8     # تشخیص کپچا
 numpy>=1.24            # تشخیص کپچا
-scikit-image>=0.21     # تشخیص کپچا (SSIM)
 cryptography>=41.0      # ورود: رمزنگاری RSA فرم (فقط اگر سایت رمزنگاری کند)

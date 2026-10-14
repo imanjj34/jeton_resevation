@@ -29,7 +29,7 @@ from reserve import (account_warning, clear_pending, current_state, load_pending
 from web_app import AppServer
 from web_select import SelectionServer
 
-# کتابخانه‌های سنگین (opencv/scikit-image/selenium) تنبل بارگذاری می‌شوند تا اولین پرسش فوراً نمایش داده شود؛
+# کتابخانه‌های سنگین (opencv/selenium) تنبل بارگذاری می‌شوند تا اولین پرسش فوراً نمایش داده شود؛
 # بارگذاری‌شان در پس‌زمینه انجام می‌شود (preload_heavy) و هر تابعی که لازم دارد _load_heavy() را صدا می‌زند.
 cv2 = np = ssim = webdriver = By = WebDriverWait = Service = TimeoutException = None
 _heavy_lock = threading.Lock()
@@ -46,7 +46,7 @@ def _load_heavy() -> None:
         from selenium.webdriver.chrome.service import Service as _Service
         from selenium.webdriver.common.by import By as _By
         from selenium.webdriver.support.ui import WebDriverWait as _Wait
-        from skimage.metrics import structural_similarity as _ssim
+        from jeton_http_login import ssim as _ssim
         import cv2 as _cv2
         np, webdriver, TimeoutException, Service, By, WebDriverWait, ssim = _np, _webdriver, _Timeout, _Service, _By, _Wait, _ssim
         cv2 = _cv2  # آخر؛ نشانه‌ی آماده بودن

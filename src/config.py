@@ -3,7 +3,7 @@ config.py - همه‌ی تنظیمات برنامه در یک فایل (config.i
 
     from config import cfg
     cfg.week            # "next"
-    cfg.headless        # True
+    cfg.retries         # 5
 
 - فایل کنار برنامه ساخته می‌شود (یا مسیر دلخواه در متغیر محیطی JETON_CONFIG).
 - اولین اجرا (فایل وجود ندارد): در ترمینال مقادیر پرسیده می‌شود و گزینه‌های قابل انتخاب نشان داده می‌شود؛
@@ -36,7 +36,6 @@ class Opt:
     lo: Optional[float] = None
     hi: Optional[float] = None
     attr: Optional[str] = None      # نام ویژگی روی cfg (پیش‌فرض: key)
-    secret: bool = False
 
     @property
     def name(self) -> str:
@@ -68,17 +67,11 @@ OPTIONS: list[Opt] = [
         "نام کاربری. خالی = هر بار پرسیده می‌شود. (متغیر محیطی JETON_USER بر این مقدم است.)", ask=True),
     Opt("login", "password", "", "str",
         "رمز عبور. توصیه: خالی بگذار و از متغیر محیطی JETON_PASS استفاده کن؛ رمز داخل فایل به‌صورت متن ساده می‌ماند.",
-        secret=True, ask=True),
-    Opt("login", "headless", True, "bool",
-        "مرورگرِ ورود و کپچا مخفی باشد؟ (پنجره‌ی پرداخت همیشه دیده می‌شود.)", ask=True),
-    Opt("login", "eager_load", True, "bool",
-        "صفحه‌ی ورود را بدون انتظار برای همه‌ی منابع باز کن (سریع‌تر). اگر ورود مشکل پیدا کرد false کن."),
+        ask=True),
     Opt("login", "retries", 5, "int", "تعداد تلاش برای ورود (کپچا گاهی اشتباه تشخیص داده می‌شود).", lo=1, hi=20),
     Opt("login", "captcha_dataset", r"dataset", "path",
         "پوشه‌ی دیتاست تصاویر مرجع کپچا (زیرپوشه‌هایی به نام ارقام)."),
     Opt("login", "captcha_threshold", 0.4, "float", "کمترین شباهت (SSIM) برای پذیرفتن یک رقم کپچا.", lo=0, hi=1),
-    Opt("login", "chromedriver_path", "", "path",
-        "مسیر chromedriver دستی. خالی = Selenium خودش مدیریت می‌کند. فقط اگر دانلود خودکار 403 داد پر کن."),
     # ---------------------------------------------------------------- fetch
     Opt("fetch", "method", "threads", "choice",
         "روش دریافت غذاهای همه‌ی سلف‌ها (برای سرعت).",
@@ -184,7 +177,7 @@ class Config:
         raise AttributeError(name)
 
     def update(self, **kw: Any) -> None:
-        """تغییر موقت در حافظه (مثل --headed)؛ داخل فایل نوشته نمی‌شود."""
+        """تغییر موقت در حافظه؛ داخل فایل نوشته نمی‌شود."""
         for k, val in kw.items():
             if k not in BY_NAME:
                 raise KeyError(k)
@@ -335,12 +328,12 @@ def ensure(path: str | os.PathLike | None = None, force_setup: bool = False, inp
 
 # ----------------------------------------------------------------------------- لاگ
 def apply_logging() -> None:
-    """سطح لاگ از فایل. لاگ‌های HTTP (httpx/urllib3/selenium) فقط در DEBUG نشان داده می‌شوند."""
+    """سطح لاگ از فایل. لاگ‌های HTTP (httpx/urllib3) فقط در DEBUG نشان داده می‌شوند."""
     import logging
     level = getattr(logging, str(cfg.log_level).upper(), logging.INFO)
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
     noisy = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
-    for name in ("httpx", "httpcore", "urllib3", "selenium", "asyncio", "charset_normalizer"):
+    for name in ("httpx", "httpcore", "urllib3", "asyncio", "charset_normalizer"):
         logging.getLogger(name).setLevel(noisy)
 
 
@@ -355,7 +348,7 @@ def docs_markdown() -> str:
          "- **ویرایش دستی:** فایل را با هر ویرایشگر متنی (UTF-8) باز کن؛ هر گزینه توضیح و مقدارهای ممکن را بالای خودش دارد. برنامه را دوباره اجرا کن.",
          "- **مسیر دیگر:** متغیر محیطی `JETON_CONFIG` را به مسیر فایل بده.",
          "- **مقدار نامعتبر:** برنامه همه‌ی خطاها را یک‌جا با نام بخش و کلید نشان می‌دهد و شروع نمی‌شود. گزینه‌ی ناشناخته فقط هشدار می‌دهد.",
-         "- **فقط برای این اجرا:** `--ui web|terminal` و `--headed` همان گزینه‌های `ui` و `headless` را موقتاً عوض می‌کنند (در فایل نوشته نمی‌شوند).",
+         "- **فقط برای این اجرا:** `--ui web|terminal` همان گزینه‌ی `ui` را موقتاً عوض می‌کند (در فایل نوشته نمی‌شوند).",
          "- **متغیرهای محیطی:** `JETON_USER` و `JETON_PASS` از `username` و `password` داخل فایل مقدم‌اند (برای این‌که رمز در فایل نماند).", ""]
     for sec in SECTIONS:
         L += [f"## [{sec}] {SECTION_TITLES[sec]}", "", "| کلید | پیش‌فرض | مقدارهای ممکن | توضیح |", "|---|---|---|---|"]
@@ -375,7 +368,7 @@ def docs_markdown() -> str:
             L.append(f"| `{o.key}` | {dflt} | {poss} | {o.doc}{asked} |")
         L.append("")
     L += ["## نمونه", "", "```ini", "[app]", "ui = web", "mode = reserve", "week = next", "",
-          "[login]", "username = 401234567", "headless = true", "",
+          "[login]", "username = 401234567", "",
           "[fetch]", "method = threads      ; برای هر وعده در هر روز یک thread", "max_threads = 0", "",
           "[ui]", "font = 2 Nazanin", "theme = dark", "```", "",
           "## نکته‌های روش دریافت منو (`[fetch] method`)", "",

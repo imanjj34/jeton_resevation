@@ -1,5 +1,5 @@
 """
-food_menu.py - استخراج برنامه غذایی از Reservation.aspx (فقط با requests؛ بدون سلنیوم).
+food_menu.py - استخراج برنامه غذایی از Reservation.aspx (فقط با requests).
 
     menu = fetch_menu(session, week="current")                 # هفته جاری
     menu = fetch_menu(session, week="next", all_selves=True)   # هفته بعد، غذاهای همه‌ی سلف‌ها
@@ -11,7 +11,6 @@ food_menu.py - استخراج برنامه غذایی از Reservation.aspx (ف�
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -25,11 +24,9 @@ from bs4 import BeautifulSoup
 from config import cfg
 from ui import GRID_CSS, THEME_BUTTON, THEME_TOGGLE_JS, base_css, theme_boot
 
-logger = logging.getLogger(__name__)
 WEEK_BUTTONS = {"next": "imgbtnNextWeek"}  # "current" = همان GET اولیه
 TABLE_ID_RE = re.compile(r"^cphMain_grdReservation(\w+)$")
 FOOD_RE = re.compile(r"^(?P<name>.*?)\s+(?P<price>[\d,٬]+)\s*ریال\s*$")
-DEFAULT_TRANSPORT = None  # فقط برای تست: httpx.MockTransport
 PLACEHOLDER = "-1"  # روزهای غیرفعال (جمعه و ...)
 
 
@@ -304,7 +301,7 @@ def _post(session, url: str, payload: dict, **fields) -> str:
 
 def fetch_menu(session, week: str = "current", all_selves: bool = True, url: Optional[str] = None,
                on_progress=None, method: Optional[str] = None, concurrency: Optional[int] = None,
-               max_threads: Optional[int] = None, transport=None) -> WeekMenu:
+               max_threads: Optional[int] = None) -> WeekMenu:
     """
     session     : requests.Session لاگین‌شده
     week        : "current" یا "next"
@@ -316,7 +313,6 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: Opt
                   "async"      asyncio + httpx با حداکثر concurrency درخواست همزمان
                   "sequential" پشت‌سرهم
     max_threads : برای threads؛ 0 = به تعداد (وعده × روز) thread
-    transport   : فقط برای تست (httpx.MockTransport)
     برای روزِ غیرفعال (یا روزی که حین کار غیرفعال شود) درخواستی فرستاده نمی‌شود.
     اگر برنامه‌ی هفته‌ی بعد هنوز ثبت نشده باشد، menu.has_food برابر False است.
     """
@@ -366,7 +362,7 @@ def fetch_menu(session, week: str = "current", all_selves: bool = True, url: Opt
         return menu
     if method == "async" and total > 1 and _can_async():
         asyncio.run(_run_jobs_async(session, url, payload, jobs_by_date, advance,
-                                    concurrency or cfg.fetch_concurrency, transport or DEFAULT_TRANSPORT))
+                                    concurrency or cfg.fetch_concurrency))
     elif method in ("threads", "async") and total > 1:   # async بدون httpx هم به threads برمی‌گردد
         _run_jobs_threads(session, url, payload, jobs_by_date, advance,
                           cfg.fetch_max_threads if max_threads is None else max_threads)
@@ -458,7 +454,7 @@ def _can_async() -> bool:
         return True
 
 
-async def _run_jobs_async(session, url, payload, jobs_by_date, advance, concurrency, transport=None) -> None:
+async def _run_jobs_async(session, url, payload, jobs_by_date, advance, concurrency) -> None:
     """
     همه‌ی postbackها با asyncio و یک اتصال‌پولِ مشترک، همزمان (حداکثر `concurrency` تا در هر لحظه).
     اگر روزی در یکی از پاسخ‌ها غیرفعال دیده شود، کارهای باقی‌مانده‌ی همان روز اصلاً فرستاده نمی‌شوند.
@@ -473,8 +469,7 @@ async def _run_jobs_async(session, url, payload, jobs_by_date, advance, concurre
     sem = asyncio.Semaphore(concurrency)
     dead: set = set()
 
-    async with httpx.AsyncClient(cookies=jar, headers=headers, limits=limits, timeout=60.0, transport=transport,
-                                 follow_redirects=True) as client:
+    async with httpx.AsyncClient(cookies=jar, headers=headers, limits=limits, timeout=60.0, follow_redirects=True) as client:
         async def one(date, meal, day, target, s) -> None:
             if date in dead:
                 return advance()

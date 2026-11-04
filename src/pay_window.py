@@ -20,8 +20,38 @@ from __future__ import annotations
 import json
 import os
 import sys
+import re
 import threading
 import time
+from typing import Optional
+
+CALLBACK_MARK = "ePay_CallBack"
+
+
+def _int(text: str) -> Optional[int]:
+    digits = re.sub(r"\D", "", text or "")
+    return int(digits) if digits else None
+
+
+def parse_callback(html: str) -> dict:
+    """نتیجه‌ی تراکنش از صفحه‌ی بازگشت (ePay_CallBack.aspx). ok فقط وقتی True است که نتیجه دقیقاً «موفق» باشد («ناموفق» نه)."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "lxml")
+
+    def text(i: str) -> str:
+        el = soup.find(id=i)
+        return " ".join(el.get_text(" ", strip=True).replace("\u200c", "").split()) if el else ""
+
+    result = text("cphMain_lblResult")
+    return {
+        "ok": result == "موفق",
+        "result": result,
+        "message": text("cphMain_lblMessage"),
+        "order_id": text("cphMain_lblOrderId"),
+        "trace": text("cphMain_lblTraceNumber"),
+        "previous_credit": _int(text("cphMain_lblPreviousCredit")),
+        "current_credit": _int(text("cphMain_lblCurrentCredit")),
+    }
 
 
 def emit(**kw) -> None:
@@ -35,7 +65,7 @@ def run(spec: dict) -> int:
         emit(event="error", message="pywebview نصب نیست: pip install pywebview")
         return 2
 
-    cookies, bank, mark = spec.get("cookies", []), spec["bank"], spec.get("callback_mark", "ePay_CallBack")
+    cookies, bank, mark = spec.get("cookies", []), spec["bank"], spec.get("callback_mark", CALLBACK_MARK)
     state = {"step": "cookies", "reported": False}
     holder: dict = {}
 
@@ -53,7 +83,6 @@ def run(spec: dict) -> int:
         if "Server Error" in html or "NullReferenceException" in html:
             emit(event="result", ok=False, result="", message="صفحه‌ی بازگشت سایت خطا داد (Server Error)")
             return
-        from payment import parse_callback
         r = parse_callback(html)
         if not r["result"]:
             emit(event="result", ok=False, result="", message="صفحه‌ی بازگشت نتیجه‌ای نشان نداد (ورود دوباره لازم شده؟)")

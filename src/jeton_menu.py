@@ -1,18 +1,16 @@
 """
-jeton_menu.py - لاگین با Selenium (+ کپچا)، سپس همه‌ی کارها با requests.
+jeton_menu.py - ورود با requests (+ کپچای SSIM)، سپس همه‌ی کارها با requests.
 
     python jeton_menu.py              # اولین اجرا: config.ini ساخته می‌شود؛ بعد از آن [app] ui تعیین می‌کند
     python jeton_menu.py --ui web     # از همان اول Chrome باز می‌شود و همه‌چیز مرحله‌به‌مرحله در صفحه‌ی وب انجام می‌شود
-    python jeton_menu.py --headed     # مرورگر لاگین/کپچا دیده شود (برای اشکال‌یابی)
+    python jeton_menu.py --setup      # پرسش دوباره‌ی تنظیمات و ساخت دوباره‌ی config.ini
 
-همه‌ی تنظیمات (هفته، فونت، تم، روش دریافت منو، headless، پرداخت و ...) در config.ini است؛ راهنما: CONFIG.md.
+همه‌ی تنظیمات (هفته، فونت، تم، روش دریافت منو، پرداخت و ...) در config.ini است؛ راهنما: CONFIG.md.
 """
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import logging
 import getpass
 import os
 import subprocess
@@ -26,43 +24,19 @@ import requests
 
 from config import ConfigError, apply_logging, cfg, ensure, save_option
 from food_menu import fallback_notice, fetch_menu, fetch_menu_with_fallback
-from payment import CALLBACK_MARK, parse_callback
+from jeton_http import PaymentError, bank_target, http_login, start_bank_payment
+from pay_window import CALLBACK_MARK
 from reserve import (account_warning, clear_pending, current_state, load_pending, logout_session, price_delta, submit,
                      summary_lines)
 from web_app import AppServer
 from web_select import SelectionServer
 
-# کتابخانه‌های سنگین (opencv/selenium) تنبل بارگذاری می‌شوند تا اولین پرسش فوراً نمایش داده شود؛
-# بارگذاری‌شان در پس‌زمینه انجام می‌شود (preload_heavy) و هر تابعی که لازم دارد _load_heavy() را صدا می‌زند.
-cv2 = np = ssim = None
-_heavy_lock = threading.Lock()
-
-
-def _load_heavy() -> None:
-    global cv2, np, ssim
-    with _heavy_lock:
-        if cv2 is not None:
-            return
-        import cv2 as _cv2
-        import numpy as _np
-        from jeton_http_login import ssim as _ssim
-        cv2, np, ssim = _cv2, _np, _ssim
-
-
-def preload_heavy() -> None:
-    threading.Thread(target=_load_heavy, daemon=True).start()
-
-
 apply_logging()  # سطح لاگ از config.ini؛ لاگ HTTP فقط در DEBUG
-logger = logging.getLogger(__name__)
 
 
 
-# ------------------------------------------------- تشخیص کپچا (همان الگوریتم SSIM قبلی)
-def get_session(username: str, password: str, headless: bool | None = None) -> requests.Session:
-    """ورود با requests و کپچای SSIM (بدون Selenium). headless فقط برای سازگاری با فراخوانی‌های قبلی است."""
-    from jeton_http_login import http_login
-    return http_login(username, password, cfg.captcha_dataset)
+def get_session(username: str, password: str) -> requests.Session:
+    return http_login(username, password, cfg.captcha_dataset, cfg.retries, cfg.captcha_threshold)
 
 
 class PaymentWindow:
@@ -107,7 +81,6 @@ def open_payment(session: requests.Session, amount: int, username: str = "", pas
     """
     import importlib.util
     import tempfile
-    from http_payment import PaymentError, bank_target, start_bank_payment
     if importlib.util.find_spec("webview") is None:
         raise PaymentError("برای پرداخت، pywebview لازم است: pip install pywebview")
     resp = start_bank_payment(session, amount, cfg.epay_url)
@@ -137,7 +110,6 @@ class Prefetch:
         self.week, self.session = week, None
         self.menus: dict = {}       # هفته -> منو (فقط چیزهایی که در پس‌زمینه دریافت شده)
         self.error: Exception | None = None
-        self.progress = ""
         self.login_done, self.menu_done = threading.Event(), threading.Event()
         self.fallback_started = threading.Event()  # هفته‌ی بعد خالی بود و هفته‌ی جاری در حال دریافت است
         threading.Thread(target=self._run, args=(username, password), daemon=True).start()
@@ -151,13 +123,12 @@ class Prefetch:
             self.menu_done.set()
             return
         self.login_done.set()
-        prog = lambda n, t: setattr(self, "progress", f"{n}/{t}")  # noqa: E731
         if self.week:
             try:
-                self.menus[self.week] = fetch_menu(self.session, self.week, all_selves=True, on_progress=prog)
+                self.menus[self.week] = fetch_menu(self.session, self.week, all_selves=True)
                 if self.week == "next" and not self.menus["next"].has_food:  # هفته بعد هنوز خالی است: فوراً هفته جاری
                     self.fallback_started.set()
-                    self.menus["current"] = fetch_menu(self.session, "current", all_selves=True, on_progress=prog)
+                    self.menus["current"] = fetch_menu(self.session, "current", all_selves=True)
             except Exception:  # noqa: BLE001  (بعداً در پیش‌زمینه دوباره امتحان می‌شود)
                 pass
         self.menu_done.set()
@@ -320,7 +291,6 @@ def _logout_if_configured(session) -> None:
 
 
 def terminal_main() -> None:
-    preload_heavy()  # همزمان با پرسش‌ها بارگذاری می‌شود
     print("=== سامانه‌ی تغذیه ===\n")
     username, password = login_prompt()
     pending = load_pending()
@@ -357,7 +327,6 @@ def terminal_main() -> None:
 
 def web_main() -> None:
     """از همان اول Chrome باز می‌شود و ورود، انتخاب کار، دریافت منو و انتخاب غذا همه در صفحه‌ی وب انجام می‌شود."""
-    preload_heavy()  # همزمان با باز شدن صفحه بارگذاری می‌شود
     creds: dict = {}
 
     def login(u: str, p: str) -> requests.Session:
@@ -383,7 +352,6 @@ def web_main() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="دریافت منو و رزرو غذا (تنظیمات: config.ini، راهنما: CONFIG.md)")
     ap.add_argument("--ui", choices=("terminal", "web"), default=None, help="فقط برای این اجرا: پرسش‌ها در ترمینال یا صفحه‌ی وب")
-    ap.add_argument("--headed", action="store_true", help="فقط برای این اجرا: مرورگر لاگین/کپچا مخفی نباشد")
     ap.add_argument("--setup", action="store_true", help="پرسش دوباره‌ی تنظیمات و ساخت دوباره‌ی config.ini")
     args = ap.parse_args()
     try:
@@ -394,8 +362,6 @@ def main() -> None:
     for w in cfg.warnings:
         print("؟", w)
     apply_logging()
-    if args.headed:
-        cfg.update(headless=False)
     web_main() if (args.ui or cfg.ui) == "web" else terminal_main()
 
 

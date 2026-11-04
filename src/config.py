@@ -192,7 +192,35 @@ cfg = Config()
 
 def config_path() -> Path:
     env = os.environ.get("JETON_CONFIG")
-    return Path(env).expanduser() if env else Path(__file__).resolve().parent.parent / "config.ini"
+    if env:
+        return Path(env).expanduser()
+    root = runtime_root()
+    return user_data_root() / "config.ini" if getattr(sys, "frozen", False) else root / "config.ini"
+
+
+def runtime_root() -> Path:
+    """Directory containing the executable in a packaged app, or the repository in development."""
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+
+
+def user_data_root() -> Path:
+    """Per-user writable directory for settings and pending reservations."""
+    if not getattr(sys, "frozen", False):
+        return runtime_root()
+    appdata = os.environ.get("APPDATA")
+    base = Path(appdata).expanduser() if appdata else Path.home() / "AppData" / "Roaming"
+    return base / "JetonReservation"
+
+
+def _resolve_path_option(name: str, value: str, config_file: Path) -> str:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path)
+    if name == "pending_file":
+        return str(config_file.parent / path)
+    if name == "captcha_dataset":
+        return str(runtime_root() / path)
+    return str(path)
 
 
 def load(path: str | os.PathLike | None = None) -> Config:
@@ -221,6 +249,8 @@ def load(path: str | os.PathLike | None = None) -> Config:
                     errors.append(f"[{sec}] {key} = {raw!r}: {e}")
     if errors:
         raise ConfigError(f"مقدار نامعتبر در {p}:\n  " + "\n  ".join(errors))
+    values["pending_file"] = _resolve_path_option("pending_file", values["pending_file"], p)
+    values["captcha_dataset"] = _resolve_path_option("captcha_dataset", values["captcha_dataset"], p)
     object.__setattr__(cfg, "_v", values)
     object.__setattr__(cfg, "path", p)
     object.__setattr__(cfg, "exists", exists)
@@ -251,6 +281,7 @@ def render(values: dict | None = None) -> str:
 
 def write(values: dict | None = None, path: str | os.PathLike | None = None) -> Path:
     p = Path(path) if path else config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(render(values), encoding="utf-8")
     return p
 
@@ -264,16 +295,14 @@ def save_option(name: str, value: Any) -> None:
 
 # ----------------------------------------------------------------------------- راه‌اندازی اولین اجرا
 def _ask_option(opt: Opt, current: Any, idx: int, total: int, input_fn: Callable, print_fn: Callable) -> Any:
-    section = SECTION_TITLES[opt.section]
-    print_fn(f"\n[{idx}/{total}] {opt.key} ({section}) - {opt.doc}")
+    print_fn(f"\n[{idx}/{total}] {opt.key}")
     if opt.kind == "choice" or opt.kind == "bool":
         items = list(opt.choices) if opt.kind == "choice" else ["true", "false"]
         for n, c in enumerate(items, 1):
-            label = opt.choice_docs.get(c, "") if opt.kind == "choice" else ("بله" if c == "true" else "خیر")
-            print_fn(f"   {n}) {c}" + (f"  - {label}" if label else ""))
+            print_fn(f"   {n}) {c}")
         default_txt = _fmt(opt, current)
         while True:
-            ans = input_fn(f"انتخاب (شماره یا مقدار) [{default_txt}]: ").strip()
+            ans = input_fn(f"Choice (number or value) [{default_txt}]: ").strip()
             if not ans:
                 return current
             if ans.isdigit() and 1 <= int(ans) <= len(items):
@@ -281,16 +310,16 @@ def _ask_option(opt: Opt, current: Any, idx: int, total: int, input_fn: Callable
             try:
                 return parse_value(opt, ans)
             except ValueError as e:
-                print_fn(f"   نامعتبر: {e}")
+                print_fn(f"   Invalid value: {e}")
     hint = f" (بازه {opt.lo:g} تا {opt.hi:g})" if opt.lo is not None else ""
     while True:
-        ans = input_fn(f"مقدار{hint} [{current}]: ").strip()
+        ans = input_fn(f"Value{hint} [{current}]: ").strip()
         if not ans:
             return current
         try:
             return parse_value(opt, ans)
         except ValueError as e:
-            print_fn(f"   نامعتبر: {e}")
+            print_fn(f"   Invalid value: {e}")
 
 
 def first_run(path: str | os.PathLike | None = None, input_fn: Callable = input, print_fn: Callable = print,
@@ -299,12 +328,12 @@ def first_run(path: str | os.PathLike | None = None, input_fn: Callable = input,
     p = Path(path) if path else config_path()
     values = {**{o.name: o.default for o in OPTIONS}, **(current or {})}
     asked = [o for o in OPTIONS if o.ask]
-    print_fn(f"\n=== راه‌اندازی اولیه ===\nفایل تنظیمات وجود ندارد؛ مقدارهای اصلی را مشخص کن (Enter = مقدار داخل [ ]).\n"
-             f"بقیه‌ی گزینه‌ها با مقدار پیش‌فرض نوشته می‌شوند و بعداً داخل {p.name} قابل ویرایش‌اند (راهنما: CONFIG.md).")
+    print_fn(f"\n=== First-time setup ===\nThe configuration file does not exist. Press Enter to accept the value in [ ].\n"
+             f"Other options use defaults and can be edited later in {p.name}.")
     for i, o in enumerate(asked, 1):
         values[o.name] = _ask_option(o, values[o.name], i, len(asked), input_fn, print_fn)
     write(values, p)
-    print_fn(f"\n✓ فایل تنظیمات ساخته شد: {p}")
+    print_fn(f"\nConfiguration file created: {p}")
     return p
 
 
@@ -346,7 +375,7 @@ def docs_markdown() -> str:
          "- **اولین اجرا:** اگر `config.ini` وجود نداشته باشد، برنامه در ترمینال مقدارهای اصلی را می‌پرسد، گزینه‌های قابل انتخاب را نشان می‌دهد و فایل را می‌سازد. (اگر ترمینال تعاملی نباشد، فایل با مقدارهای پیش‌فرض ساخته می‌شود.)",
          "- **پرسش دوباره:** `python jeton_menu.py --setup` (مقدارهای فعلی به‌عنوان پیش‌فرض نشان داده می‌شوند).",
          "- **ویرایش دستی:** فایل را با هر ویرایشگر متنی (UTF-8) باز کن؛ هر گزینه توضیح و مقدارهای ممکن را بالای خودش دارد. برنامه را دوباره اجرا کن.",
-         "- **مسیر دیگر:** متغیر محیطی `JETON_CONFIG` را به مسیر فایل بده.",
+         "- **مسیر دیگر:** متغیر محیطی `JETON_CONFIG` را به مسیر فایل بده. در نسخه‌ی بسته‌بندی‌شده، `config.ini` و `pending.json` داخل `%APPDATA%/JetonReservation` نگه‌داری می‌شوند.",
          "- **مقدار نامعتبر:** برنامه همه‌ی خطاها را یک‌جا با نام بخش و کلید نشان می‌دهد و شروع نمی‌شود. گزینه‌ی ناشناخته فقط هشدار می‌دهد.",
          "- **فقط برای این اجرا:** `--ui web|terminal` همان گزینه‌ی `ui` را موقتاً عوض می‌کند (در فایل نوشته نمی‌شوند).",
          "- **متغیرهای محیطی:** `JETON_USER` و `JETON_PASS` از `username` و `password` داخل فایل مقدم‌اند (برای این‌که رمز در فایل نماند).", ""]
@@ -382,9 +411,9 @@ def docs_markdown() -> str:
 
 if __name__ == "__main__":
     if "--docs" in sys.argv:
-        Path(__file__).resolve().with_name("CONFIG.md").write_text(docs_markdown(), encoding="utf-8")
-        print("CONFIG.md ساخته شد")
+        config_path().with_name("CONFIG.md").write_text(docs_markdown(), encoding="utf-8")
+        print("CONFIG.md created")
     elif "--write-default" in sys.argv:
-        print("ساخته شد:", write())
+        print("Created:", write())
     else:
         print(__doc__)

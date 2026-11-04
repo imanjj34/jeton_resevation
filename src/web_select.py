@@ -504,14 +504,14 @@ class SelectionServer:
 
     def run(self, launch: bool = True) -> None:
         url = self.start()
-        print(f"\nصفحه‌ی انتخاب غذا: {url}")
+        print(f"\nMeal selection page: {url}")
         if launch:
             open_browser(url)
-        print("بعد از انتخاب همه‌ی غذاها در صفحه روی «ثبت نهایی» بزن. توقف برنامه: Ctrl+C")
+        print("After selecting all meals, click the final submit button. Stop with Ctrl+C.")
         try:
             self.httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nمتوقف شد.")
+            print("\nStopped.")
         finally:
             self.stop.set()
             self._logout_quietly()

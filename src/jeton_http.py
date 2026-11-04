@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import time
 from html import escape
@@ -88,18 +87,14 @@ def _gray(data: bytes) -> np.ndarray:
 _cache: dict = {}
 
 
-def _load_dataset(path: str) -> dict:
-    if path not in _cache:
-        data = {}
-        for digit in sorted(os.listdir(path)):
-            folder = os.path.join(path, digit)
-            if not os.path.isdir(folder):
-                continue
-            refs = [cv2.imdecode(np.fromfile(os.path.join(folder, f), np.uint8), cv2.IMREAD_GRAYSCALE)
-                    for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-            data[digit] = [r for r in refs if r is not None]
-        _cache[path] = data
-    return _cache[path]
+def _load_dataset(path: str = "") -> dict:
+    if "embedded" not in _cache:
+        from captcha_data import CAPTCHA_DATA, IMAGE_SHAPE
+        _cache["embedded"] = {
+            digit: [np.asarray(values, dtype=np.uint8).reshape(IMAGE_SHAPE) for values in refs]
+            for digit, refs in CAPTCHA_DATA.items()
+        }
+    return _cache["embedded"]
 
 
 def read_captcha(img_bytes: bytes, dataset_path: str, threshold: float = 0.4) -> str:
@@ -187,8 +182,6 @@ def _attempt(s: requests.Session, username: str, password: str, dataset_path: st
 
 
 def http_login(username: str, password: str, dataset_path: str, attempts: int = 5, threshold: float = 0.4) -> requests.Session:
-    if not os.path.isdir(dataset_path):
-        raise FileNotFoundError(f"پوشه‌ی دیتاست کپچا پیدا نشد: {dataset_path}")
     s = requests.Session()
     s.headers["User-Agent"] = UA
     code, resp = "", None

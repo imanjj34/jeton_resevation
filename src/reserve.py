@@ -79,11 +79,11 @@ def summary_lines(menu: WeekMenu, choices: list[Choice]) -> list[str]:
     for ch in choices:
         day = find_day(menu, ch.meal, ch.date)
         head = f"{ch.weekday} {ch.date} - {ch.meal_title}: "
-        old = f" (رزرو فعلی {day.amount:,} ریال برمی‌گردد)" if day and day.reserved and day.amount else ""
+        old = f" (current reservation refund: {day.amount:,} rial)" if day and day.reserved and day.amount else ""
         if ch.reserve:
-            lines.append(f"{head}{ch.self_name} / {ch.food_name} ({ch.price:,} ریال){old}")
+            lines.append(f"{head}{ch.self_name} / {ch.food_name} ({ch.price:,} rial){old}")
         else:
-            lines.append(f"{head}لغو رزرو{old}")
+            lines.append(f"{head}Cancel reservation{old}")
     return lines
 
 
@@ -149,8 +149,8 @@ def account_warning(typed: str, account: Optional[dict]) -> Optional[str]:
     acc_id = ((account or {}).get("id") or "").strip()
     typed = (typed or "").strip()
     if typed.isdigit() and acc_id.isdigit() and typed != acc_id:
-        return (f"سایت حساب با شماره {acc_id} را نشان می‌دهد، نه {typed} که وارد کردی. "
-                "احتمالاً نشست حساب قبلی هنوز روی سرور باز است؛ «خروج» را بزن و دوباره وارد شو.")
+        return (f"The site shows account {acc_id}, not the entered account {typed}. "
+                "A previous session may still be active; log out and sign in again.")
     return None
 
 
@@ -164,15 +164,15 @@ def logout_session(session, url: Optional[str] = None) -> tuple[bool, str]:
         r = session.get(url)
         r.raise_for_status()
         if "txtUsernamePlain" in r.text:
-            return True, "از قبل خارج شده بود"
+            return True, "Already logged out"
         payload = _form_payload(BeautifulSoup(r.text, "lxml"))
         out = session.post(url, data={**payload, "__EVENTTARGET": "ctl00$logout", "__EVENTARGUMENT": ""})
         out.raise_for_status()
         check = session.get(url)
         check.raise_for_status()
         if "txtUsernamePlain" in check.text:
-            return True, "از حساب خارج شدی"
-        return False, "سایت هنوز حساب را وارد شده نشان می‌دهد"
+            return True, "Logged out"
+        return False, "The site still shows the account as logged in"
     except Exception as e:  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
 
@@ -191,7 +191,7 @@ def _apply_row(session, url, html, ticks, ch, say):
     tag = f"  {ch.weekday} {ch.date}"
     day = find_day(parse_page(html), ch.meal, ch.date)
     if day is None or not day.active or day.locked:
-        say(f"{tag} ✗ روز قفل یا غیرفعال است")
+        say(f"{tag} FAILED: day is locked or disabled")
         return html, "روز قفل یا غیرفعال است", None
     f = day.fields
 
@@ -201,46 +201,46 @@ def _apply_row(session, url, html, ticks, ch, say):
             day = find_day(parse_page(html), ch.meal, ch.date)
         if not (day and day.selected_self and day.selected_self.id == ch.self_id):
             now = day.selected_self.name if day and day.selected_self else "؟"
-            say(f"{tag} ✗ سلف «{ch.self_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد")
+            say(f"{tag} FAILED: cafeteria '{ch.self_name}' was not selected; site shows '{now}'")
             return html, f"سلف «{ch.self_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد", None
-        say(f"{tag} ← ۱) سلف «{ch.self_name}» ✓")
+        say(f"{tag} 1) Cafeteria '{ch.self_name}' selected")
 
         if not any(x.id == ch.food_id for x in day.selected_self.foods):
-            say(f"{tag} ✗ غذای «{ch.food_name}» دیگر در لیست نیست")
+            say(f"{tag} FAILED: meal '{ch.food_name}' is no longer available")
             return html, f"غذای «{ch.food_name}» دیگر در لیست نیست", None
         if not day.selected_food or day.selected_food.id != ch.food_id:
             html = _step(session, url, html, ticks, __EVENTTARGET=f["food"], __EVENTARGUMENT="", **{f["food"]: ch.food_id})
             day = find_day(parse_page(html), ch.meal, ch.date)
         if not (day and day.selected_food and day.selected_food.id == ch.food_id):
             now = day.selected_food.name if day and day.selected_food else "؟"
-            say(f"{tag} ✗ غذای «{ch.food_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد")
-            return html, f"غذای «{ch.food_name}» انتخاب نشد؛ سامانه «{now}» را نشان می‌دهد", None
-        say(f"{tag} ← ۲) غذای «{ch.food_name}» ✓")
+            say(f"{tag} FAILED: meal '{ch.food_name}' was not selected; site shows '{now}'")
+            return html, f"Meal '{ch.food_name}' was not selected; site shows '{now}'", None
+        say(f"{tag} 2) Meal '{ch.food_name}' selected")
         ticks[f["chk"]] = True
-        say(f"{tag} ← ۳) تیک رزرو روشن شد ✓")
+        say(f"{tag} 3) Reservation enabled")
     else:
         ticks[f["chk"]] = False
-        say(f"{tag} ← تیک رزرو خاموش شد (لغو رزرو) ✓")
+        say(f"{tag} Reservation disabled (cancelled)")
     return html, None, f["chk"]
 
 
 def describe_state(day: Optional[DayEntry]) -> str:
     """آنچه سامانه همین الان برای این روز/وعده ثبت کرده است (برای پیام‌های خطا)."""
     if day is None:
-        return "این روز در صفحه دیده نشد"
+        return "Day not found on the page"
     if not day.reserved:
-        return "رزرو نشده"
+        return "Not reserved"
     sv, fd = day.selected_self, day.selected_food
-    txt = "رزرو شده"
+    txt = "Reserved"
     if sv and fd:
         txt += f": {sv.name} / {fd.name}"
     if day.amount:
-        txt += f" ({day.amount:,} ریال)"
+        txt += f" ({day.amount:,} rial)"
     return txt
 
 
 def describe_want(ch: Choice) -> str:
-    return "لغو رزرو" if not ch.reserve else f"{ch.self_name} / {ch.food_name} ({ch.price:,} ریال)"
+    return "Cancel reservation" if not ch.reserve else f"{ch.self_name} / {ch.food_name} ({ch.price:,} rial)"
 
 
 def _row_ok(menu: WeekMenu, ch: Choice) -> bool:
@@ -274,7 +274,7 @@ def submit(session, choices: list[Choice], url: Optional[str] = None, on_step: O
     verified: list[Choice] = []      # انتخاب‌هایی که هر وعده‌شان بعد از ذخیره تأیید شد
     for meal_key in dict.fromkeys(c.meal for c in choices):
         chs = [c for c in choices if c.meal == meal_key]
-        say(f"▶ وعده {chs[0].meal_title or meal_key}")
+        say(f">>> Meal {chs[0].meal_title or meal_key}")
         ticks: dict[str, bool] = {}
         problems: list[str] = []
         applied: list[tuple[Choice, str]] = []
@@ -293,7 +293,7 @@ def submit(session, choices: list[Choice], url: Optional[str] = None, on_step: O
             if not lost:
                 break
             for ch, chk in lost:
-                say(f"  {ch.weekday} {ch.date} ↻ انتخاب از فرم پاک شده بود؛ دوباره اعمال می‌شود")
+                say(f"  {ch.weekday} {ch.date}: form selection was cleared; applying again")
                 html, err, _ = _apply_row(session, url, html, ticks, ch, say)
                 if err:
                     ticks.pop(chk, None)
@@ -304,27 +304,27 @@ def submit(session, choices: list[Choice], url: Optional[str] = None, on_step: O
             if not _row_ok(current, ch):
                 ticks.pop(chk, None)
                 applied.remove((ch, chk))
-                problems.append(f"{ch.weekday} {ch.date}: انتخاب روی فرم پایدار نماند؛ ثبت نشد")
-                say(f"  {ch.weekday} {ch.date} ✗ انتخاب روی فرم پایدار نماند؛ ثبت نمی‌شود")
+                problems.append(f"{ch.weekday} {ch.date}: selection did not persist; not submitted")
+                say(f"  {ch.weekday} {ch.date}: selection did not persist; not submitting")
 
         if not applied:
-            say(f"  هیچ ردیفی برای ذخیره‌ی {chs[0].meal_title or meal_key} آماده نبود ✗")
+            say(f"  No row was ready for {chs[0].meal_title or meal_key}")
             results.append({"meal": meal_key, "ok": False, "message": None, "problems": problems})
             continue
 
         meal = find_meal(current, meal_key)
-        say(f"  ذخیره‌ی {meal.title} ...")
+        say(f"  Submitting {meal.title} ...")
         html = _step(session, url, html, ticks, **{meal.save_name: meal.save_value})
         after = parse_page(html)
 
         for ch, _chk in applied:  # راستی‌آزمایی از روی صفحه‌ی برگشتی
             d = find_day(after, ch.meal, ch.date)
             ok = bool(d) and d.reserved == ch.reserve and _row_ok(after, ch)
-            say(f"  {ch.weekday} {ch.date} " + ("✓ ثبت شد" if ok else f"✗ خواسته: {describe_want(ch)} ← سامانه ثبت کرده: {describe_state(d)}"))
+            say(f"  {ch.weekday} {ch.date} " + ("submitted" if ok else f"FAILED: requested {describe_want(ch)}; site recorded {describe_state(d)}"))
             if not ok:
-                problems.append(f"{ch.weekday} {ch.date}: خواسته‌ی تو «{describe_want(ch)}»؛ سامانه ثبت کرده «{describe_state(d)}»")
+                problems.append(f"{ch.weekday} {ch.date}: requested '{describe_want(ch)}'; site recorded '{describe_state(d)}'")
         if after.message:
-            say(f"  پیام سایت: {after.message}")
+            say(f"  Site message: {after.message}")
         results.append({"meal": meal_key, "ok": not problems, "message": after.message, "problems": problems,
                         "credit": after.credit})
         verified += [ch for ch, _chk in applied if _row_ok(after, ch) and find_day(after, ch.meal, ch.date).reserved == ch.reserve]
@@ -339,35 +339,35 @@ def _final_check(session, url: str, before: WeekMenu, verified: list[Choice], sa
     بررسی نهایی: بعد از ذخیره‌ی همه‌ی وعده‌ها، صفحه‌ی هفته یک بار دیگر تازه از سایت خوانده می‌شود
     (نه از پاسخ ذخیره) و همه‌ی تغییرها دوباره با آن مقایسه می‌شود؛ اعتبار نهایی هم با پیش‌بینی سنجیده می‌شود.
     """
-    say("▶ بررسی نهایی از روی سایت")
+    say(">>> Final verification from the website")
     problems: list[str] = []
     warnings: list[str] = []
     credit = None
     try:
         final = parse_page(_open_week(session, url, {c.date for c in verified}))
     except Exception as e:  # noqa: BLE001
-        say(f"  ✗ خواندن دوباره‌ی صفحه ناموفق بود: {type(e).__name__}: {e}")
-        return {"meal": "بررسی نهایی", "ok": False, "message": None, "credit": None, "warnings": [],
-                "problems": [f"خواندن دوباره‌ی صفحه ناموفق بود: {type(e).__name__}: {e}"]}
+        say(f"  FAILED to reload the page: {type(e).__name__}: {e}")
+        return {"meal": "Final verification", "ok": False, "message": None, "credit": None, "warnings": [],
+                "problems": [f"Failed to reload the page: {type(e).__name__}: {e}"]}
     for ch in verified:
         d = find_day(final, ch.meal, ch.date)
         ok = d is not None and d.reserved == ch.reserve and _row_ok(final, ch)
-        say(f"  {ch.weekday} {ch.date} · {ch.meal_title}: " + ("✓ تأیید شد" if ok else f"✗ سامانه ثبت کرده: {describe_state(d)}"))
+        say(f"  {ch.weekday} {ch.date} · {ch.meal_title}: " + ("verified" if ok else f"FAILED: site recorded {describe_state(d)}"))
         if not ok:
-            problems.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): خواسته‌ی تو «{describe_want(ch)}»؛ سامانه ثبت کرده «{describe_state(d)}»")
+            problems.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): requested '{describe_want(ch)}'; site recorded '{describe_state(d)}'")
         elif ch.reserve and d.amount and ch.price and d.amount != ch.price:   # غذا درست است ولی مبلغ ثبت‌شده فرق دارد
-            warnings.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): مبلغ ثبت‌شده در سامانه {d.amount:,} ریال است (قیمت غذا {ch.price:,})")
-            say(f"  ؟ {warnings[-1]}")
+            warnings.append(f"{ch.weekday} {ch.date} ({ch.meal_title}): site amount is {d.amount:,} rial (meal price {ch.price:,})")
+            say(f"  WARNING: {warnings[-1]}")
     credit = final.credit
     try:
         expected = (before.credit or 0) - price_delta(before, verified)
         if before.credit is not None and credit is not None and credit != expected:
-            warnings.append(f"اعتبار نهایی {credit:,} با پیش‌بینی {expected:,} ریال نمی‌خواند؛ در سایت چک کن")
-            say(f"  ؟ {warnings[-1]}")
+            warnings.append(f"Final balance {credit:,} does not match expected {expected:,} rial; check the website")
+            say(f"  WARNING: {warnings[-1]}")
     except LookupError:
         pass
     if credit is not None:
-        say(f"  اعتبار نهایی: {credit:,} ریال")
+        say(f"  Final balance: {credit:,} rial")
     return {"meal": "بررسی نهایی", "ok": not problems, "message": None, "problems": problems, "warnings": warnings,
             "credit": credit}
 

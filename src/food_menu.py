@@ -493,8 +493,8 @@ async def _run_jobs_async(session, url, payload, jobs_by_date, advance, concurre
 
 
 def fallback_notice(next_menu: WeekMenu, current_menu: WeekMenu) -> str:
-    return (f"منوی هفته بعد ({next_menu.week_range or '؟'}) هنوز غذایی ثبت نشده است؛ "
-            f"منوی هفته جاری ({current_menu.week_range or '؟'}) نمایش داده می‌شود.")
+    return (f"Next week's menu ({next_menu.week_range or '?'}) has no meals yet; "
+            f"showing the current week's menu ({current_menu.week_range or '?'}).")
 
 
 def fetch_menu_with_fallback(session, week: str, **kw) -> tuple[WeekMenu, Optional[str]]:
@@ -508,4 +508,3 @@ def fetch_menu_with_fallback(session, week: str, **kw) -> tuple[WeekMenu, Option
         if current.has_food:
             return current, fallback_notice(menu, current)
     return menu, None
-

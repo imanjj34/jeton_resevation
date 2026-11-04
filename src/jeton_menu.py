@@ -22,7 +22,7 @@ import webbrowser
 
 import requests
 
-from config import ConfigError, apply_logging, cfg, ensure, save_option
+from config import ConfigError, apply_logging, cfg, ensure, runtime_root, save_option
 from food_menu import fallback_notice, fetch_menu, fetch_menu_with_fallback
 from jeton_http import PaymentError, bank_target, http_login, start_bank_payment
 from pay_window import CALLBACK_MARK
@@ -93,7 +93,9 @@ def open_payment(session: requests.Session, amount: int, username: str = "", pas
         json.dump(spec, f, ensure_ascii=False)
     # opencv با import شدن مسیر pluginهای Qt خودش را در محیط می‌گذارد؛ به پنجره‌ی پرداخت (Qt در لینوکس/مک) نرسد
     env = {k: v for k, v in os.environ.items() if k not in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR")}
-    proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name("pay_window.py")), f.name], stdout=subprocess.PIPE,
+    command = ([sys.executable, "--payment-window", f.name] if getattr(sys, "frozen", False)
+               else [sys.executable, str(Path(__file__).with_name("pay_window.py")), f.name])
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env)
     return PaymentWindow(proc, f.name)
 
@@ -136,7 +138,7 @@ class Prefetch:
     def wait(self, week: str | None):
         """(session، منوی آماده یا None، پیام اطلاع‌رسانی یا None). اگر ورود شکست خورده باشد همان خطا بالا می‌آید."""
         if not self.login_done.is_set():
-            print("در حال تکمیل ورود به سامانه ...")
+            print("Completing login ...")
         self.login_done.wait()
         if self.error:
             raise self.error
@@ -145,7 +147,7 @@ class Prefetch:
         if week != self.week and not (week == "current" and self.fallback_started.is_set()):
             return self.session, None, None  # این هفته پیش‌دریافت نمی‌شود؛ مستقیم گرفته می‌شود
         if not self.menu_done.is_set():
-            print("در حال تکمیل دریافت منو ...")
+            print("Completing menu download ...")
         self.menu_done.wait()
         menu = self.menus.get(week)
         if menu is not None and not (week == "next" and not menu.has_food):
@@ -167,54 +169,52 @@ def choose(prompt: str, options: list[str], default: int = 1) -> int:
     for i, o in enumerate(options, 1):
         print(f"  {i}) {o}")
     while True:
-        ans = input(f"انتخاب [{default}]: ").strip() or str(default)
+        ans = input(f"Choice [{default}]: ").strip() or str(default)
         if ans.isdigit() and 1 <= int(ans) <= len(options):
             return int(ans)
-        print("عدد معتبر وارد کن.")
+        print("Enter a valid number.")
 
 
 def login_prompt() -> tuple[str, str]:
     """نام کاربری/رمز از config.ini (یا متغیر محیطی JETON_USER / JETON_PASS)؛ اگر نبود، پرسیده می‌شود."""
-    username = cfg.username or ask("نام کاربری")
-    password = cfg.password or getpass.getpass("رمز عبور (هنگام تایپ نمایش داده نمی‌شود): ")
-    if not os.path.isdir(cfg.captcha_dataset):
-        print(f"پوشه‌ی دیتاست کپچا پیدا نشد: {cfg.captcha_dataset}")
-        save_option("captcha_dataset", ask("مسیر پوشه‌ی دیتاست کپچا"))
+    username = cfg.username or ask("Username")
+    password = cfg.password or getpass.getpass("Password (input hidden): ")
     return username, password
 
 
 def ask_week() -> str:
     weeks = ["current", "next"]
-    return weeks[choose("\nکدام هفته؟", ["هفته جاری", "هفته بعد (برای رزرو)"], weeks.index(cfg.week) + 1) - 1]
+    return weeks[choose("\nWhich week?", ["Current week", "Next week"], weeks.index(cfg.week) + 1) - 1]
 
 
 def show_progress(n: int, total: int) -> None:
     width = 30
     filled = int(width * n / total) if total else width
-    print(f"\r  [{'█' * filled}{'░' * (width - filled)}] {int(100 * n / total) if total else 100}٪", end="", flush=True)
+    print(f"\r  [{'#' * filled}{'-' * (width - filled)}] {int(100 * n / total) if total else 100}%", end="", flush=True)
 
 
 def report(results: list[dict]) -> None:
     print()
     for r in results:
-        print(f"{'✓' if r['ok'] else '✗'} {r['meal']}" + (f" - پیام سایت: {r['message']}" if r.get("message") else ""))
+        print(f"{'OK' if r['ok'] else 'FAILED'} {r['meal']}" + (f" - Site message: {r['message']}" if r.get("message") else ""))
         for pr in r["problems"]:
             print(f"    ! {pr}")
         for w in r.get("warnings", []):
-            print(f"    ؟ {w}")
+            print(f"    WARNING: {w}")
         if r.get("credit") is not None:
-            print(f"    موجودی پس از ذخیره: {r['credit']:,} ریال")
+            print(f"    Balance after submission: {r['credit']:,} rial")
     if all(r["ok"] for r in results):
         clear_pending()
-        print("\nهمه‌ی تغییرات ثبت و تأیید شد.")
+        print("\nAll changes were submitted and verified.")
     else:
-        print("\nبعضی موارد ثبت نشد؛ پیام‌های بالا را ببین و صفحه‌ی سایت را هم چک کن.")
+        print("\nSome items were not submitted. Review the messages and check the website.")
 
 
 # ------------------------------------------------------------------ حالت‌ها
 def ask_file_options() -> tuple[str, bool]:
-    ext = [".html", ".json", ".txt"][choose("\nفرمت خروجی؟", ["HTML (صفحه‌ی وب، خواناترین)", "JSON", "متن ساده"]) - 1]
-    out = ask("نام فایل خروجی", f"menu{ext}")
+    ext = [".html", ".json", ".txt"][choose("\nOutput format?", ["HTML", "JSON", "Plain text"]) - 1]
+    default = str(runtime_root() / f"menu{ext}") if getattr(sys, "frozen", False) else f"menu{ext}"
+    out = ask("نام فایل خروجی", default)
     if not os.path.splitext(out)[1]:
         out += ext
     open_after = ext == ".html" and ask("بعد از ساخت، در مرورگر باز شود؟ (y/n)", "y").lower().startswith("y")
@@ -224,7 +224,7 @@ def ask_file_options() -> tuple[str, bool]:
 def _menu_or_fetch(session, week: str, menu=None):
     """منوی آماده را برمی‌گرداند یا (با جایگزینی هفته جاری اگر هفته بعد خالی بود) همین حالا می‌گیرد."""
     if menu is None:
-        print("\nدر حال دریافت برنامه غذایی همه‌ی سلف‌ها ...")
+        print("\nDownloading menus from all cafeterias ...")
         menu, notice = fetch_menu_with_fallback(session, week, all_selves=True, on_progress=show_progress)
         print()
         if notice:
@@ -235,15 +235,17 @@ def _menu_or_fetch(session, week: str, menu=None):
 def mode_menu_file(session, week: str, out: str, open_after: bool, menu=None) -> None:
     menu = _menu_or_fetch(session, week, menu)
     if not menu.has_food:
-        print(f"\nبرای این هفته ({menu.week_range}) هنوز غذایی ثبت نشده است." + (f"\n{menu.message}" if menu.message else ""))
+        print(f"\nNo meals are available for this week ({menu.week_range})." + (f"\n{menu.message}" if menu.message else ""))
         return
 
     ext = os.path.splitext(out)[1].lower()
+    if ext == ".html" and getattr(sys, "frozen", False) and not os.path.isabs(out):
+        out = str(runtime_root() / out)
     content = (json.dumps(menu.to_dict(), ensure_ascii=False, indent=2) if ext == ".json"
                else menu.to_text() if ext == ".txt" else menu.to_html())
     with open(out, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"\nذخیره شد: {os.path.abspath(out)}")
+    print(f"\nSaved to: {os.path.abspath(out)}")
     if open_after:
         webbrowser.open("file://" + os.path.abspath(out))
 
@@ -251,7 +253,7 @@ def mode_menu_file(session, week: str, out: str, open_after: bool, menu=None) ->
 def mode_reserve(session, relogin, username: str, password: str, week: str, menu=None) -> None:
     menu = _menu_or_fetch(session, week, menu)
     if not menu.has_food:
-        print(f"\nبرای این هفته ({menu.week_range}) هنوز غذایی ثبت نشده است.")
+        print(f"\nNo meals are available for this week ({menu.week_range}).")
         return
     # انتخاب در صفحه‌ی وب انجام می‌شود و بعد از «ثبت نهایی» روی سایت اعمال می‌شود
     SelectionServer(session, menu, relogin,
@@ -266,15 +268,15 @@ def mode_pending(session, relogin) -> None:
     try:
         menu = current_state(session, choices)
     except LookupError as e:
-        print(f"\n{e}\nاین انتخاب‌ها دیگر معتبر نیستند؛ فایل {cfg.pending_file} را حذف می‌کنم.")
+        print(f"\n{e}\nThese saved choices are no longer valid. Removing {cfg.pending_file}.")
         clear_pending()
         return
     delta, credit = price_delta(menu, choices), menu.credit or 0
-    print("\nانتخاب‌های ذخیره‌شده:\n" + "\n".join(summary_lines(menu, choices)))
-    print(f"\nتغییر موجودی: {-delta:+,} ریال  |  موجودی: {credit:,} ریال")
+    print("\nSaved choices:\n" + "\n".join(summary_lines(menu, choices)))
+    print(f"\nBalance change: {-delta:+,} rial  |  Balance: {credit:,} rial")
     if delta > credit:
-        print(f"\nموجودی هنوز کافی نیست؛ کمبود: {delta - credit:,} ریال.\n"
-              "بعد از افزایش اعتبار (مثلاً از «پرداخت اینترنتی» در صفحه‌ی انتخاب غذا) دوباره همین گزینه را اجرا کن.")
+        print(f"\nBalance is insufficient; shortfall: {delta - credit:,} rial.\n"
+              "Add credit, then run this option again.")
         return
     if ask("\nثبت شود؟ (y/n)", "y").lower().startswith("y"):
         report(submit(session, choices, on_step=print))
@@ -287,20 +289,20 @@ def _logout_if_configured(session) -> None:
     """[app] logout_on_exit: بعد از پایان کار، نشستِ روی سرور هم بسته می‌شود (نه فقط برنامه). سرور وب خودش خارج می‌شود."""
     if cfg.logout_on_exit and session is not None:
         ok, msg = logout_session(session)
-        print("از حساب خارج شدی." if ok else f"خروج از حساب تأیید نشد: {msg}")
+        print("Logged out." if ok else f"Logout was not confirmed: {msg}")
 
 
 def terminal_main() -> None:
-    print("=== سامانه‌ی تغذیه ===\n")
+    print("=== Meal Reservation ===\n")
     username, password = login_prompt()
     pending = load_pending()
 
     # از همین لحظه ورود (و دریافت منوی هفته‌ی پیش‌فرض) در پس‌زمینه شروع می‌شود؛ بقیه‌ی سؤال‌ها همزمان پرسیده می‌شود
     prefetch = Prefetch(username, password, cfg.week if cfg.mode in ("reserve", "file") else None)
 
-    options = ["مشاهده‌ی منو، انتخاب غذا (در صفحه‌ی وب) و ثبت رزرو", "فقط دریافت منو و ساخت فایل"]
+    options = ["View menu, select meals in the web page, and reserve", "Download menu and create a file"]
     if pending:
-        options.append(f"ثبت انتخاب‌های ذخیره‌شده ({len(pending)} مورد، بعد از شارژ موجودی)")
+        options.append(f"Submit saved choices ({len(pending)} items)")
     default = MODE_KEYS.index(cfg.mode) + 1 if MODE_KEYS.index(cfg.mode) < len(options) else 1
     mode = MODE_KEYS[choose("\nچه کاری انجام شود؟", options, default) - 1]
     week = ask_week() if mode in ("reserve", "file") else None
@@ -311,9 +313,9 @@ def terminal_main() -> None:
         print("\n" + notice)
     if menu is not None and (menu.account_name or menu.account_id):   # بازخورد خودِ سایت
         acct = {"name": menu.account_name, "id": menu.account_id}
-        print("حساب واردشده در سایت: " + " · ".join(x for x in acct.values() if x))
+        print("Account on the website: " + " · ".join(x for x in acct.values() if x))
         if account_warning(username, acct):
-            print("⚠ " + account_warning(username, acct))
+            print("WARNING: " + account_warning(username, acct))
     relogin = lambda: get_session(username, password)
     if mode == "reserve":
         mode_reserve(session, relogin, username, password, week, menu)
@@ -343,24 +345,28 @@ def web_main() -> None:
         relogin=lambda: get_session(creds["u"], creds["p"]),
         pay_opener=lambda sess, amount: open_payment(sess, amount, creds["u"], creds["p"]),
         env_user=cfg.username, env_pass=cfg.password,
-        dataset_ok=lambda: os.path.isdir(cfg.captcha_dataset), set_dataset=set_dataset,
+        dataset_ok=lambda: True, set_dataset=set_dataset,
         default_mode=cfg.mode, default_week=cfg.week,
         close_pay_window=cfg.close_payment_window, exit_when_done=cfg.exit_after_success,
     ).run()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="دریافت منو و رزرو غذا (تنظیمات: config.ini، راهنما: CONFIG.md)")
-    ap.add_argument("--ui", choices=("terminal", "web"), default=None, help="فقط برای این اجرا: پرسش‌ها در ترمینال یا صفحه‌ی وب")
-    ap.add_argument("--setup", action="store_true", help="پرسش دوباره‌ی تنظیمات و ساخت دوباره‌ی config.ini")
+    if len(sys.argv) == 3 and sys.argv[1] == "--payment-window":
+        from pay_window import run
+        with open(sys.argv[2], encoding="utf-8-sig") as f:
+            raise SystemExit(run(json.load(f)))
+    ap = argparse.ArgumentParser(description="Download menus and reserve meals (config: config.ini)")
+    ap.add_argument("--ui", choices=("terminal", "web"), default=None, help="Choose terminal or web interaction for this run")
+    ap.add_argument("--setup", action="store_true", help="Recreate the configuration file")
     args = ap.parse_args()
     try:
         ensure(force_setup=args.setup)   # فایل نبود (یا --setup): مقدارها در ترمینال پرسیده و فایل ساخته می‌شود
     except ConfigError as e:
-        print(f"\n✗ {e}\nفایل را اصلاح کن (راهنما: CONFIG.md) یا برای ساخت دوباره: python jeton_menu.py --setup")
+        print(f"\nERROR: {e}\nFix the configuration file or run: python jeton_menu.py --setup")
         raise SystemExit(2)
     for w in cfg.warnings:
-        print("؟", w)
+        print("WARNING:", w)
     apply_logging()
     web_main() if (args.ui or cfg.ui) == "web" else terminal_main()
 

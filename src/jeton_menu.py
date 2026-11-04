@@ -15,7 +15,10 @@ import json
 import logging
 import getpass
 import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 import time
 import webbrowser
 
@@ -31,25 +34,19 @@ from web_select import SelectionServer
 
 # کتابخانه‌های سنگین (opencv/selenium) تنبل بارگذاری می‌شوند تا اولین پرسش فوراً نمایش داده شود؛
 # بارگذاری‌شان در پس‌زمینه انجام می‌شود (preload_heavy) و هر تابعی که لازم دارد _load_heavy() را صدا می‌زند.
-cv2 = np = ssim = webdriver = By = WebDriverWait = Service = TimeoutException = None
+cv2 = np = ssim = None
 _heavy_lock = threading.Lock()
 
 
 def _load_heavy() -> None:
-    global cv2, np, ssim, webdriver, By, WebDriverWait, Service, TimeoutException
+    global cv2, np, ssim
     with _heavy_lock:
         if cv2 is not None:
             return
-        import numpy as _np
-        from selenium import webdriver as _webdriver
-        from selenium.common.exceptions import TimeoutException as _Timeout
-        from selenium.webdriver.chrome.service import Service as _Service
-        from selenium.webdriver.common.by import By as _By
-        from selenium.webdriver.support.ui import WebDriverWait as _Wait
-        from jeton_http_login import ssim as _ssim
         import cv2 as _cv2
-        np, webdriver, TimeoutException, Service, By, WebDriverWait, ssim = _np, _webdriver, _Timeout, _Service, _By, _Wait, _ssim
-        cv2 = _cv2  # آخر؛ نشانه‌ی آماده بودن
+        import numpy as _np
+        from jeton_http_login import ssim as _ssim
+        cv2, np, ssim = _cv2, _np, _ssim
 
 
 def preload_heavy() -> None:
@@ -62,227 +59,70 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------- تشخیص کپچا (همان الگوریتم SSIM قبلی)
-_dataset_cache: dict = {}
-_dataset_lock = threading.Lock()
-
-
-def _load_dataset(path: str) -> dict:
-    """تصاویر مرجع فقط یک بار از دیسک خوانده می‌شوند (قبلاً برای هر رقم و هر تلاش دوباره خوانده می‌شدند)."""
-    with _dataset_lock:
-        if path not in _dataset_cache:
-            data = {}
-            for digit in os.listdir(path):
-                digit_path = os.path.join(path, digit)
-                if not os.path.isdir(digit_path):
-                    continue
-                refs = []
-                for file in os.listdir(digit_path):
-                    if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                        ref = cv2.imread(os.path.join(digit_path, file), cv2.IMREAD_GRAYSCALE)
-                        if ref is not None:
-                            refs.append(ref)
-                data[digit] = refs
-            _dataset_cache[path] = data
-        return _dataset_cache[path]
-
-
-def recognize(driver) -> str:
-    _load_heavy()
-    crop_coords = [(9, 77, 34, 94), (9, 98, 34, 115), (9, 119, 34, 136), (9, 139, 34, 156)]
-    try:
-        WebDriverWait(driver, 10, poll_frequency=0.1).until(lambda d: d.execute_script(
-            "var i=document.getElementById('Img1');return !!i && i.complete && i.naturalWidth>0;"))
-        img = driver.find_element("id", "Img1")
-        img_base64 = driver.execute_script(
-            """
-            var canvas = document.createElement('canvas');
-            canvas.width = arguments[0].naturalWidth;
-            canvas.height = arguments[0].naturalHeight;
-            canvas.getContext('2d').drawImage(arguments[0], 0, 0);
-            return canvas.toDataURL('image/png').split(',')[1];
-            """,
-            img,
-        )
-        image = cv2.imdecode(np.frombuffer(base64.b64decode(img_base64), np.uint8), cv2.IMREAD_GRAYSCALE)
-        _, binary = cv2.threshold(image, 160, 255, cv2.THRESH_BINARY)
-        digit_images = [binary[y1:y2, x1:x2] for y1, x1, y2, x2 in crop_coords]
-        dataset = _load_dataset(cfg.captcha_dataset)
-
-        result = ""
-        for input_img in digit_images:
-            best_digit, best_score = "?", 0
-            for digit, refs in dataset.items():
-                scores = []
-                for ref in refs:
-                    try:
-                        scores.append(ssim(input_img, ref))
-                    except Exception:
-                        continue
-                if scores and np.mean(scores) > best_score:
-                    best_score, best_digit = np.mean(scores), digit
-            result += best_digit if best_score >= cfg.captcha_threshold else "?"
-        return result
-    except Exception as e:
-        logger.error(f"خطا در تشخیص کپچا: {e}")
-        return "????"
-
-
-# ------------------------------------------------------- لاگین (سلنیوم)
-def _try_login(driver, username: str, password: str) -> bool:
-    _load_heavy()
-    driver.get(cfg.base_url)
-    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtUsernamePlain"), username)
-    driver.execute_script("arguments[0].value = arguments[1];", driver.find_element(By.ID, "txtPasswordPlain"), password)
-    captcha = recognize(driver).strip()
-    logger.info(f"کپچا: {captcha}")
-    captcha_input = driver.find_element(By.ID, "txtCaptcha")
-    captcha_input.clear()
-    captcha_input.send_keys(captcha)
-    driver.find_element(By.ID, "btnEncript").click()
-    try:
-        WebDriverWait(driver, 5, poll_frequency=0.1).until(lambda d: d.current_url in cfg.home_url)
-        return True
-    except TimeoutException:
-        return False
-
-
-def _new_driver(headless: bool = False, eager: bool = False) -> webdriver.Chrome:
-    _load_heavy()
-    options = webdriver.ChromeOptions()
-    options.add_argument("--disable-gpu")
-    if eager:
-        options.page_load_strategy = "eager"  # فقط برای لاگین؛ پنجره‌ی پرداخت کامل لود می‌شود
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    if headless:
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1280,900")
-    return webdriver.Chrome(service=Service(cfg.chromedriver_path) if cfg.chromedriver_path else None, options=options)
-
-
-def _driver_login(driver, username: str, password: str) -> None:
-    for attempt in range(1, cfg.retries + 1):
-        logger.info(f"تلاش لاگین {attempt}/{cfg.retries}")
-        if _try_login(driver, username, password):
-            return
-        time.sleep(0.2)
-    raise RuntimeError("لاگین ناموفق (نام کاربری/رمز یا تشخیص کپچا را بررسی کن)")
-
-
-def _cookies_to_session(driver, session: requests.Session) -> None:
-    for c in driver.get_cookies():
-        session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
-
-
 def get_session(username: str, password: str, headless: bool | None = None) -> requests.Session:
-    """ورود با requests و کپچای SSIM (بدون Selenium). پارامتر headless فقط برای سازگاری با فراخوانی‌های قبلی است."""
+    """ورود با requests و کپچای SSIM (بدون Selenium). headless فقط برای سازگاری با فراخوانی‌های قبلی است."""
     from jeton_http_login import http_login
     return http_login(username, password, cfg.captcha_dataset)
 
 
-# ------------------------------------------------------------ پرداخت اینترنتی
-class PaymentBrowser:
-    """پنجره‌ی مرورگری که کاربر در آن پرداخت را در صفحه‌ی بانک انجام می‌دهد."""
+class PaymentWindow:
+    """
+    پنجره‌ی پرداخت (pay_window.py با pywebview) در یک پردازش جدا. کوکی‌های نشست برنامه داخل همان پنجره گذاشته می‌شود
+    تا صفحه‌ی بازگشت از بانک (ePay_CallBack) نشست را ببیند. نتیجه فقط گزارش می‌شود؛ موجودی را کاربر دستی بروز می‌کند.
+    """
 
-    def __init__(self, driver):
-        self.driver = driver
+    def __init__(self, proc: subprocess.Popen, spec_path: str):
+        self.proc, self.spec_path, self.events = proc, spec_path, []
+        threading.Thread(target=self._read, daemon=True).start()
 
-    def wait_for_result(self, stop, timeout_sec: float | None = None, poll_sec: float = 1.0):
-        """
-        منتظر می‌ماند تا مرورگر از بانک به ePay_CallBack.aspx برگردد و نتیجه را از همان صفحه می‌خواند.
-        فقط آدرس پنجره را می‌بیند (محلی است)؛ هیچ درخواستی به سایت/بانک نمی‌زند.
-        خروجی: دیکشنری نتیجه | {"closed": True} اگر پنجره بسته شد | None اگر stop خورد یا مهلت تمام شد.
-        """
-        _load_heavy()
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            try:
+                self.events.append(json.loads(line))
+            except ValueError:
+                pass
+
+    def wait_for_result(self, stop, timeout_sec=None, poll_sec=1.0):
+        """تا بسته شدن پنجره (یا لغو/مهلت) منتظر می‌ماند. خروجی: {"manual": True, "result": رویداد نتیجه/خطا یا None} | None اگر لغو شد."""
         timeout_sec = timeout_sec or cfg.payment_timeout_minutes * 60
         waited = 0.0
-        while not stop.is_set() and waited < timeout_sec:
-            try:
-                url = self.driver.current_url
-            except Exception:  # noqa: BLE001  (پنجره را کاربر بسته است)
-                return {"closed": True}
-            if CALLBACK_MARK in url:
-                try:
-                    WebDriverWait(self.driver, 15).until(lambda d: d.find_elements(By.ID, "cphMain_lblResult"))
-                except Exception:  # noqa: BLE001
-                    pass
-                return parse_callback(self.driver.page_source)
+        while self.proc.poll() is None and not stop.is_set() and waited < timeout_sec:
             stop.wait(poll_sec)
             waited += poll_sec
-        return None
+        if stop.is_set():
+            return None
+        time.sleep(0.3)  # خواندن آخرین خط‌های خروجی
+        found = [e for e in self.events if e.get("event") in ("result", "error")]
+        return {"manual": True, "result": found[-1] if found else None}
 
     def close(self) -> None:
-        try:
-            self.driver.quit()
-        except Exception:  # noqa: BLE001
-            pass
+        if self.proc.poll() is None:
+            self.proc.terminate()
 
 
-def _page_alert(driver) -> str:
-    return (driver.execute_script(
-        "var e=document.getElementById('cphMain_alertBoxValue');return e?e.textContent:'';") or "").strip()
-
-
-def _set_cookies_cdp(driver, session: requests.Session) -> bool:
+def open_payment(session: requests.Session, amount: int, username: str = "", password: str = "") -> PaymentWindow:
     """
-    کوکی‌های ورود را با پروتکل DevTools مستقیم در مرورگر می‌گذارد، بدون این‌که اول هیچ صفحه‌ای از سایت باز شود؛
-    پس هیچ درخواستِ بی‌کوکی (که روی سرور یک نشست خالی می‌سازد) فرستاده نمی‌شود. اگر پشتیبانی نشد False.
+    ۱) مبلغ و دکمه‌ها با requests؛ ۲) پنجره‌ی pywebview با کوکی‌های نشست باز می‌شود و بانک را نشان می‌دهد.
+    اگر pywebview نصب نباشد، قبل از هر کاری خطا می‌دهد (پرداخت بدون نشست، صفحه‌ی بازگشت را می‌شکند).
     """
-    try:
-        driver.execute_cdp_cmd("Network.enable", {})
-        for c in session.cookies:
-            params = {"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)}
-            if c.domain:
-                params["domain"] = c.domain.lstrip(".")
-            else:
-                params["url"] = cfg.base_url
-            res = driver.execute_cdp_cmd("Network.setCookie", params)
-            if isinstance(res, dict) and res.get("success") is False:
-                return False
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def open_payment(session: requests.Session, amount: int, username: str, password: str) -> PaymentBrowser:
-    """
-    یک پنجره‌ی Chrome باز می‌کند (با همان کوکی‌های لاگین) و مثل کاربر جلو می‌رود:
-      ۱) صفحه‌ی «افزایش اعتبار اینترنتی»: مبلغ را می‌نویسد و روی درگاه کلیک می‌کند.
-      ۲) صفحه‌ی «تأیید پرداخت»: اگر مبلغِ نشان‌داده‌شده با مبلغ خواسته‌شده یکی بود، «پرداخت» را می‌زند.
-      ۳) از اینجا به بعد (کارت و رمز در صفحه‌ی بانک) فقط کار خود کاربر است؛ اطلاعات کارت از این برنامه عبور نمی‌کند.
-    پنجره باز می‌ماند تا PaymentBrowser.close().
-    """
-    _load_heavy()
-    driver = _new_driver()
-    try:
-        if not _set_cookies_cdp(driver, session):
-            # پشتیبان: برای add_cookie باید روی دامنه باشیم. فایل ایستا (نه صفحه‌ی aspx) باز می‌شود تا نشست تازه‌ی بی‌کوکی ساخته نشود
-            driver.get(cfg.base_url + "favicon.ico")
-            for c in session.cookies:
-                driver.add_cookie({"name": c.name, "value": c.value, "path": c.path or "/", "secure": bool(c.secure)})
-        driver.get(cfg.epay_url)
-        if not driver.find_elements(By.ID, "cphMain_txtPaymentAmount"):
-            # کوکی‌ها پذیرفته نشد؛ در همین پنجره لاگین می‌کنیم و کوکی‌های جدید را به session هم می‌دهیم
-            _driver_login(driver, username, password)
-            _cookies_to_session(driver, session)
-            driver.get(cfg.epay_url)
-        WebDriverWait(driver, 10).until(lambda d: d.find_elements(By.ID, "cphMain_txtPaymentAmount"))
-        box = driver.find_element(By.ID, "cphMain_txtPaymentAmount")
-        driver.execute_script("arguments[0].value = arguments[1];", box, f"{amount:,}")
-        driver.find_element(By.ID, "cphMain_dataLstBank_imgBankLogo_0").click()
-
-        # صفحه‌ی تأیید (با ajax عوض می‌شود): یا دکمه‌ی «پرداخت» می‌آید یا پیام خطا
-        WebDriverWait(driver, 15).until(lambda d: d.find_elements(By.ID, "cphMain_btnPay") or _page_alert(d))
-        if not driver.find_elements(By.ID, "cphMain_btnPay"):
-            raise RuntimeError(f"سایت مبلغ را نپذیرفت: {_page_alert(driver)}")
-        shown = "".join(ch for ch in driver.find_element(By.ID, "cphMain_lblPaymentAmount_").text if ch.isdigit())
-        if shown != str(amount):
-            driver.find_element(By.ID, "cphMain_btnCancel").click()
-            raise RuntimeError(f"مبلغ صفحه‌ی تأیید ({shown or '؟'}) با مبلغ خواسته‌شده ({amount}) یکی نیست؛ انصراف زده شد")
-        driver.find_element(By.ID, "cphMain_btnPay").click()
-        return PaymentBrowser(driver)
-    except Exception:
-        driver.quit()
-        raise
+    import importlib.util
+    import tempfile
+    from http_payment import PaymentError, bank_target, start_bank_payment
+    if importlib.util.find_spec("webview") is None:
+        raise PaymentError("برای پرداخت، pywebview لازم است: pip install pywebview")
+    resp = start_bank_payment(session, amount, cfg.epay_url)
+    host = cfg.base_url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0]  # بدون پورت
+    spec = {"title": "پرداخت اینترنتی", "inject_url": cfg.base_url.rstrip("/") + "/favicon.ico", "callback_mark": CALLBACK_MARK, "close_on_success": bool(cfg.close_payment_window),
+            "cookies": [{"name": c.name, "value": c.value, "path": c.path or "/"} for c in session.cookies
+                        if not c.domain or host.endswith(c.domain.lstrip("."))],
+            "bank": bank_target(resp)}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(spec, f, ensure_ascii=False)
+    # opencv با import شدن مسیر pluginهای Qt خودش را در محیط می‌گذارد؛ به پنجره‌ی پرداخت (Qt در لینوکس/مک) نرسد
+    env = {k: v for k, v in os.environ.items() if k not in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR")}
+    proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name("pay_window.py")), f.name], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env)
+    return PaymentWindow(proc, f.name)
 
 
 # ------------------------------------------------- ورود و دریافت منو در پس‌زمینه

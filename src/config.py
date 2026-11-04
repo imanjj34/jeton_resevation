@@ -92,8 +92,8 @@ OPTIONS: list[Opt] = [
     Opt("fetch", "concurrency", 8, "int", "فقط برای روش async: حداکثر درخواست همزمان.", lo=1, hi=64,
         attr="fetch_concurrency"),
     # ---------------------------------------------------------------- payment
-    Opt("payment", "close_window", False, "bool",
-        "بعد از نتیجه‌ی پرداخت، پنجره‌ی بانک خودکار بسته شود؟ false = باز می‌ماند.", ask=True, attr="close_payment_window"),
+    Opt("payment", "close_window", True, "bool",
+        "بعد از پرداخت موفق، پنجره‌ی بانک خودکار بسته شود و موجودی بروز شود؟ در پرداخت ناموفق پنجره باز می‌ماند تا خطا را ببینی.", ask=True, attr="close_payment_window"),
     Opt("payment", "timeout_minutes", 30, "int",
         "چند دقیقه منتظر برگشت از بانک بمانیم؟", lo=1, hi=240, attr="payment_timeout_minutes"),
     # ---------------------------------------------------------------- ui

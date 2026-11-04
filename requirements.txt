@@ -1,10 +1,11 @@
 # نصب: pip install -r requirements.txt
-# (Python 3.10 یا بالاتر؛ برای ورود و پرداخت، Google Chrome هم باید نصب باشد)
-selenium>=4.6          # لاگین و پنجره‌ی پرداخت (chromedriver را خودش مدیریت می‌کند)
-requests>=2.31         # همه‌ی درخواست‌ها بعد از ورود
-httpx>=0.25            # دریافت همزمان منو با asyncio (اگر نصب نباشد، پشت‌سرهم انجام می‌شود)
+# (Python 3.10 یا بالاتر)
+requests>=2.31         # همه‌ی درخواست‌ها (ورود، منو، رزرو، پرداخت)
 beautifulsoup4>=4.12   # خواندن صفحه‌های سایت
-lxml>=4.9              # پارسر سریع برای beautifulsoup4
+lxml>=4.9              # پارسر beautifulsoup4 (در کد با نام "lxml" صدا زده می‌شود)
 opencv-python>=4.8     # تشخیص کپچا
-numpy>=1.24            # تشخیص کپچا
-cryptography>=41.0      # ورود: رمزنگاری RSA فرم (فقط اگر سایت رمزنگاری کند)
+numpy>=1.24            # تشخیص کپچا (SSIM)
+Pillow>=10.0           # خواندن تصویر کپچا اگر GIF باشد (جایگزین opencv)
+cryptography>=41.0     # رمزنگاری RSA فرم ورود (فقط اگر سایت رمزنگاری کند)
+pywebview>=5.0         # پنجره‌ی پرداخت (روی ویندوز با Edge WebView2)
+httpx>=0.25            # اختیاری: فقط برای [fetch] method = async

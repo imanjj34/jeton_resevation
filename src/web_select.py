@@ -272,8 +272,7 @@ class SelectionServer:
             return
         finally:
             self.pay_opening = False
-        self._log("پنجره‌ی پرداخت باز شد و مبلغ تأیید شد. کارت و رمز را فقط در همان پنجره (صفحه‌ی بانک) وارد کن. "
-                  "بعد از برگشت به سایت، نتیجه خوانده می‌شود و (در صورت پرداخت موفق) ادامه می‌دهم.")
+        self._log("پنجره‌ی پرداخت باز شد. کارت و رمز را فقط در همان پنجره (صفحه‌ی بانک) وارد کن؛ بعد از پایان، «بروزرسانی موجودی» را بزن.")
         try:
             res = self.pay_browser.wait_for_result(self.stop)  # فقط آدرس پنجره را می‌بیند، به سایت درخواست نمی‌زند
         except Exception as e:  # noqa: BLE001
@@ -281,6 +280,36 @@ class SelectionServer:
             res = {"closed": True}
         if res is None:  # لغو شد (api_cancel خودش پنجره را بسته)
             self.job.update(job="idle")
+            return
+        if res.get("manual"):  # پنجره‌ی pywebview؛ بروزرسانی موجودی دستی است
+            self._release_pay()
+            r = res.get("result") or {}
+            if r.get("event") == "error":
+                msg = f"پنجره‌ی پرداخت: {r.get('message')}"
+                self._log(msg)
+                self.job.update(job="idle", error=msg)
+            elif r.get("event") == "result" and r.get("ok"):
+                self._log("نتیجه‌ی تراکنش: موفق" + (f" (کد پیگیری {r['trace']})" if r.get("trace") else ""))
+                before = self.menu.credit if self.menu else None
+                try:   # فقط یک بار، بعد از موفق بودن، موجودی از سایت خوانده می‌شود
+                    credit = self._with_relogin(lambda: read_credit(self.session))
+                except Exception as e:  # noqa: BLE001
+                    credit = None
+                    self._log(f"خواندن موجودی خطا داد ({type(e).__name__}). «بروزرسانی موجودی» را بزن.")
+                if credit is None:
+                    self.job.update(job="idle")
+                else:
+                    if self.menu:
+                        self.menu.credit = credit
+                    self._log(f"موجودی بروز شد: {credit:,} ریال")
+                    self.job.update(job="paid", paid={"before": before, "after": credit, "trace": r.get("trace", "")})
+            elif r.get("event") == "result":
+                msg = f"نتیجه‌ی تراکنش: {r.get('result') or 'ناموفق'} - {r.get('message') or ''}".strip(" -")
+                self._log(msg)
+                self.job.update(job="idle", error=msg)
+            else:
+                self._log("پنجره‌ی پرداخت بسته شد. اگر پرداخت کرده‌ای «بروزرسانی موجودی» را بزن.")
+                self.job.update(job="idle")
             return
         self._release_pay()
         if res.get("closed"):
@@ -872,7 +901,7 @@ $("pay").onclick = function(){
   var amt = parseAmt($("payamt").value);
   if(amt <= 0){ $("payamt").focus(); return; }
   var reserveAfter = lastShort > 0 && amt >= lastShort;
-  if(!confirm("پرداخت " + fmt(amt) + " ریال" + (reserveAfter ? "\nبعد از پرداخت موفق، انتخاب‌ها خودکار ثبت می‌شوند." : "") + "؟")) return;
+  if(!confirm("پرداخت " + fmt(amt) + " ریال" + "" + "؟")) return;
   api("POST", reserveAfter ? "/api/pay" : "/api/topup", {amount: amt}, function(j){
     if(j.state === "paying"){ busy = true; refresh(); show("info", "در حال باز کردن پنجره‌ی پرداخت ...", -1); startPoll(); }
     else show("err", j.message || "خطا");
